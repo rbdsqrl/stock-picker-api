@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+.venv/
+*.egg-info/
+
+# Environment
+.env
+
+# Local SQLite (not used in prod but keep out of git)
+../data/
+*.db
