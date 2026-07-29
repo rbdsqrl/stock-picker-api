@@ -62,6 +62,9 @@ def init_db():
                 target_hit            INTEGER,
                 target_hit_date       TEXT,
                 target_hit_days       INTEGER,
+                sl_hit                INTEGER,
+                sl_hit_date           TEXT,
+                sl_hit_days           INTEGER,
                 fundamental_floor_pct REAL,
                 outcome_price   REAL,
                 outcome_pct     REAL,
@@ -117,6 +120,9 @@ def init_db():
             ("fundamental_floor_pct", "REAL"),
             ("outcome_price",         "REAL"),
             ("outcome_pct",           "REAL"),
+            ("sl_hit",                "INTEGER"),
+            ("sl_hit_date",           "TEXT"),
+            ("sl_hit_days",           "INTEGER"),
         ]:
             cur.execute(f"ALTER TABLE picks ADD COLUMN IF NOT EXISTS {col} {typedef}")
 
@@ -225,7 +231,7 @@ def check_and_update_target_hits() -> dict:
     try:
         cur = _cur(conn)
         cur.execute(
-            "SELECT id, ticker, date, target FROM picks "
+            "SELECT id, ticker, date, target, stop_loss FROM picks "
             "WHERE target_hit IS NULL AND target IS NOT NULL AND date <= %s",
             (today.isoformat(),),
         )
@@ -241,6 +247,7 @@ def check_and_update_target_hits() -> dict:
         ticker     = row["ticker"] + ".NS"
         pick_date  = row["date"]
         target     = row["target"]
+        stop_loss  = row["stop_loss"]
         days_since = (today - date_type.fromisoformat(pick_date)).days
 
         try:
@@ -253,28 +260,51 @@ def check_and_update_target_hits() -> dict:
             row_dates = [d.date() for d in row_dates]
 
             df = df.reset_index(drop=True)
-            df["High"]  = pd.to_numeric(df["High"],  errors="coerce")
-            df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
-            df = df.dropna(subset=["High"])
+            for col in ("High", "Low", "Close"):
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            df = df.dropna(subset=["High", "Low"])
             if df.empty:
                 continue
 
-            hit_mask = (df["High"] >= target) | (df["Close"].fillna(0) >= target)
+            # Scan day-by-day: whichever event (target or SL) happens first wins
+            target_event = None
+            sl_event     = None
+            for i in range(len(df)):
+                high  = df["High"].iloc[i]
+                low   = df["Low"].iloc[i]
+                close = df["Close"].fillna(high).iloc[i]
+                d     = row_dates[i]
+
+                target_today = high >= target or close >= target
+                sl_today     = stop_loss is not None and low <= stop_loss
+
+                if target_today and not sl_event:
+                    target_event = d
+                    break
+                if sl_today and not target_event:
+                    sl_event = d
+                    break
+
             c = get_conn()
             try:
                 cur2 = _cur(c)
-                if hit_mask.any():
-                    hit_pos  = int(hit_mask.idxmax())
-                    hit_date = row_dates[hit_pos].isoformat()
-                    hit_days = (row_dates[hit_pos] - date_type.fromisoformat(pick_date)).days
+                if target_event:
+                    hit_days = (target_event - date_type.fromisoformat(pick_date)).days
                     cur2.execute(
                         "UPDATE picks SET target_hit=1, target_hit_date=%s, target_hit_days=%s WHERE id=%s",
-                        (hit_date, hit_days, pick_id),
+                        (target_event.isoformat(), hit_days, pick_id),
                     )
-                    log.info(f"Target hit: {ticker} pick={pick_date} hit={hit_date} days={hit_days}")
-                elif days_since > 90:
+                    log.info(f"Target hit: {ticker} pick={pick_date} hit={target_event} days={hit_days}")
+                elif sl_event:
+                    sl_days = (sl_event - date_type.fromisoformat(pick_date)).days
+                    cur2.execute(
+                        "UPDATE picks SET target_hit=0, sl_hit=1, sl_hit_date=%s, sl_hit_days=%s WHERE id=%s",
+                        (sl_event.isoformat(), sl_days, pick_id),
+                    )
+                    log.info(f"SL hit: {ticker} pick={pick_date} sl={sl_event} days={sl_days}")
+                elif days_since > 45:
                     cur2.execute("UPDATE picks SET target_hit=0 WHERE id=%s", (pick_id,))
-                    log.info(f"Target missed (90d expired): {ticker} pick={pick_date}")
+                    log.info(f"Target missed (45d expired): {ticker} pick={pick_date}")
                 c.commit()
                 updated += 1
             finally:
@@ -366,14 +396,14 @@ def recalculate_all_levels() -> int:
         cur2 = _cur(c)
         cur2.execute("""
             UPDATE picks
-            SET stop_loss  = ROUND(CAST(price_at_pick * 0.97 AS numeric), 2),
-                stop_pct   = 3.0,
-                target     = ROUND(CAST(price_at_pick * 1.06 AS numeric), 2),
-                target_pct = 6.0,
+            SET stop_loss  = ROUND(CAST(price_at_pick * 0.95 AS numeric), 2),
+                stop_pct   = 5.0,
+                target     = ROUND(CAST(price_at_pick * 1.10 AS numeric), 2),
+                target_pct = 10.0,
                 rr_ratio   = 2.0
             WHERE price_at_pick IS NOT NULL
-              AND (target_pct < 6.0 OR target_pct IS NULL
-                   OR stop_pct > 3.0 OR stop_pct IS NULL
+              AND (target_pct < 10.0 OR target_pct IS NULL
+                   OR stop_pct < 5.0 OR stop_pct IS NULL
                    OR rr_ratio IS NULL OR rr_ratio < 2.0)
         """)
         bad = cur2.rowcount
@@ -382,7 +412,7 @@ def recalculate_all_levels() -> int:
         c.close()
 
     if bad:
-        log.info(f"Enforced 6%% minimum on {bad} pick(s) with stale targets")
+        log.info(f"Enforced 5%% SL / 10%% target minimum on {bad} pick(s) with stale levels")
         updated += bad
 
     return updated
