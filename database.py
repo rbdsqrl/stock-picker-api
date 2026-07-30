@@ -406,12 +406,16 @@ def check_and_update_target_hits(force: bool = False) -> dict:
 
 
 def recalculate_all_levels() -> int:
-    """One-off backfill: rewrite entry_breakout/stop/target on historical picks.
+    """Backfill stop / T1 / T2 on historical picks under the current policy.
 
-    NOT wired to any endpoint on purpose. These levels are anchored to the date
-    the call was given, so rewriting them retroactively rescores the track record
-    against goalposts the pick never actually had. Run manually only, to repair
-    rows that were saved with genuinely broken levels.
+    The ENTRY IS NEVER TOUCHED. price_at_pick stays exactly as recorded, and every
+    level is derived from it, so a pick keeps the entry it was actually called at.
+    ATR and the swing low come from data up to the pick date only — no post-pick
+    information leaks in — which also makes this idempotent: re-running it produces
+    the same numbers.
+
+    Outcomes computed against the old levels are stale afterwards, so callers must
+    follow this with check_and_update_target_hits(force=True).
     """
     import yfinance as yf
     import pandas as pd
@@ -420,7 +424,10 @@ def recalculate_all_levels() -> int:
     conn = get_conn()
     try:
         cur = _cur(conn)
-        cur.execute("SELECT id, ticker, date, fundamental_floor_pct FROM picks WHERE price_at_pick IS NOT NULL")
+        cur.execute(
+            "SELECT id, ticker, date, price_at_pick, fundamental_floor_pct "
+            "FROM picks WHERE price_at_pick IS NOT NULL"
+        )
         rows = cur.fetchall()
     finally:
         conn.close()
@@ -430,6 +437,7 @@ def recalculate_all_levels() -> int:
         pick_id   = row["id"]
         ticker    = row["ticker"] + ".NS"
         pick_date = row["date"]
+        entry     = row["price_at_pick"]
         floor_pct = row["fundamental_floor_pct"]
 
         try:
@@ -447,32 +455,36 @@ def recalculate_all_levels() -> int:
             if len(df) < 14:
                 continue
 
-            levels = compute_trade_levels(df["Close"], df["High"], df["Low"])
+            # entry_price pins every level to the recorded entry
+            levels = compute_trade_levels(df["Close"], df["High"], df["Low"], entry_price=entry)
 
             if floor_pct:
-                price      = levels["entry_cmp"]
-                fund_floor = price * (1 + floor_pct / 100)
+                fund_floor = entry * (1 + floor_pct / 100)
                 if fund_floor > levels["target"]:
-                    risk = price - levels["stop_loss"]
+                    risk = entry - levels["stop_loss"]
                     levels["target"]          = round(fund_floor, 2)
                     levels["target_pct"]      = round(floor_pct, 1)
-                    levels["rr_ratio"]        = round((fund_floor - price) / risk, 2) if risk > 0 else 2.0
+                    levels["rr_ratio"]        = round((fund_floor - entry) / risk, 2) if risk > 0 else 2.0
                     atr = levels["atr_14"]
-                    levels["target_days_est"] = max(5, min(45, round((fund_floor - price) / atr * 2))) if atr > 0 else 10
+                    levels["target_days_est"] = max(5, min(45, round((fund_floor - entry) / atr * 2))) if atr > 0 else 10
 
             c = get_conn()
             try:
                 cur2 = _cur(c)
+                # price_at_pick and entry_breakout are deliberately absent — the entry
+                # a pick was called at is a fact of record, not something to recompute.
                 cur2.execute("""
                     UPDATE picks SET
                         stop_loss=%s, stop_pct=%s, target=%s, target_pct=%s,
-                        atr_14=%s, rr_ratio=%s, target_days_est=%s, entry_breakout=%s
+                        target_short=%s, target_short_pct=%s,
+                        atr_14=%s, rr_ratio=%s, target_days_est=%s
                     WHERE id=%s
                 """, (
-                    levels["stop_loss"], levels["stop_pct"],
-                    levels["target"],    levels["target_pct"],
-                    levels["atr_14"],    levels["rr_ratio"],
-                    levels["target_days_est"], levels["entry_breakout"],
+                    levels["stop_loss"],    levels["stop_pct"],
+                    levels["target"],       levels["target_pct"],
+                    levels["target_short"], levels["target_short_pct"],
+                    levels["atr_14"],       levels["rr_ratio"],
+                    levels["target_days_est"],
                     pick_id,
                 ))
                 c.commit()
@@ -485,31 +497,9 @@ def recalculate_all_levels() -> int:
         except Exception as e:
             log.warning(f"recalculate_levels: {ticker} {pick_date} — {e}")
 
-    # Enforce hard limits on bad/stale picks
-    c = get_conn()
-    try:
-        cur2 = _cur(c)
-        cur2.execute("""
-            UPDATE picks
-            SET stop_loss  = ROUND(CAST(price_at_pick * 0.95 AS numeric), 2),
-                stop_pct   = 5.0,
-                target     = ROUND(CAST(price_at_pick * 1.10 AS numeric), 2),
-                target_pct = 10.0,
-                rr_ratio   = 2.0
-            WHERE price_at_pick IS NOT NULL
-              AND (target_pct < 10.0 OR target_pct IS NULL
-                   OR stop_pct < 5.0 OR stop_pct IS NULL
-                   OR rr_ratio IS NULL OR rr_ratio < 2.0)
-        """)
-        bad = cur2.rowcount
-        c.commit()
-    finally:
-        c.close()
-
-    if bad:
-        log.info(f"Enforced 5%% SL / 10%% target minimum on {bad} pick(s) with stale levels")
-        updated += bad
-
+    # The old blanket "enforce 5% SL / 10% target" sweep that used to run here is
+    # gone. It overwrote levels with flat percentages regardless of volatility,
+    # which is exactly the behaviour the ATR-based policy replaces.
     return updated
 
 

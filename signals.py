@@ -277,7 +277,8 @@ def _bb_width(close: pd.Series, period=20) -> pd.Series:
     std = close.rolling(period).std()
     return (4 * std) / sma.replace(0, np.nan)
 
-def compute_trade_levels(close: pd.Series, high: pd.Series, low: pd.Series) -> dict:
+def compute_trade_levels(close: pd.Series, high: pd.Series, low: pd.Series,
+                         entry_price: float | None = None) -> dict:
     """
     ATR-calibrated entry, stop, and target levels.
 
@@ -287,20 +288,27 @@ def compute_trade_levels(close: pd.Series, high: pd.Series, low: pd.Series) -> d
     Target     — 2× the actual risk (1:2 R:R), floored at MIN_TARGET_PCT. No 52W high
                  cap — that cap was squashing targets to <3% while stops stayed at 10%,
                  inverting R:R. 52W high is noted as resistance, not a hard ceiling.
+
+    entry_price pins the levels to an entry already on record instead of deriving it
+    from the last close. Backfilling historical picks needs this: a pick made
+    mid-session was recorded at the price at that moment, not at the day's close, so
+    re-deriving the entry would silently move it.
     """
-    price          = float(close.iloc[-1])
+    price          = float(entry_price) if entry_price is not None else float(close.iloc[-1])
     day_high       = float(high.iloc[-1])
     atr            = _atr(high, low, close)
 
     entry_cmp      = price
     entry_breakout = round(day_high * 1.002, 2)
 
-    # min() takes the lower of the two, so risk is never less than STOP_ATR_MULT ATRs.
-    # This is what stops a stock sitting on its 5-day low from getting a near-zero stop.
-    stop_atr  = price - STOP_ATR_MULT * atr
-    swing_low = float(low.iloc[-5:].min())
-    stop_raw  = min(stop_atr, swing_low)
-    stop_loss = round(max(stop_raw, price * (1 - MAX_RISK_PCT / 100)), 2)
+    # Exactly STOP_ATR_MULT ATRs, then bounded by MAX_RISK_PCT. There used to be a
+    # min() against the 5-day swing low, but that only ever WIDENED the stop, and the
+    # MAE study says no eventual winner drew more than 1.46 ATR — so extra width buys
+    # no additional winner retention, only larger losses. It also broke badly when the
+    # entry is pinned above the pick-day close (backfill), where the swing low sits far
+    # below and dragged stops out to 3 ATR.
+    stop_loss = round(max(price - STOP_ATR_MULT * atr,
+                          price * (1 - MAX_RISK_PCT / 100)), 2)
 
     risk = price - stop_loss
 

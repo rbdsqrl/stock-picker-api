@@ -8,7 +8,7 @@ import logging
 import os
 from datetime import datetime
 from signals import run_screening, run_screening_combined
-from database import init_db, get_today_picks, get_today_watchlist, get_history, get_watchlist_history, save_pick, save_watchlist_picks, update_outcome, check_and_update_target_hits
+from database import init_db, get_today_picks, get_today_watchlist, get_history, get_watchlist_history, save_pick, save_watchlist_picks, update_outcome, check_and_update_target_hits, recalculate_all_levels
 
 log = logging.getLogger(__name__)
 
@@ -122,6 +122,39 @@ async def refresh_outcomes():
     except Exception as e:
         log.exception(f"refresh_outcomes: failed — {e}")
         raise
+
+@app.post("/api/pick/recalculate-levels")
+async def recalculate_levels():
+    """Backfill stop / T1 / T2 on historical picks under the current policy.
+
+    Kept separate from refresh-outcomes on purpose: that one only re-scores, this
+    one rewrites levels. The entry (price_at_pick) is never touched, and ATR comes
+    from pick-date data only, so this is idempotent — running it twice changes
+    nothing the second time.
+    """
+    log.info("recalculate_levels: started")
+    try:
+        recalculated = await asyncio.to_thread(recalculate_all_levels)
+        # Levels just moved, so every stored outcome is stale — re-resolve them all.
+        result = await asyncio.to_thread(check_and_update_target_hits, True)
+        log.info(
+            f"recalculate_levels: done — levels={recalculated} changed={result['updated']} "
+            f"hits={result['hits']} t1={result['t1_hits']} misses={result['misses']} "
+            f"pending={result['pending']} failed={result['failed']}"
+        )
+        return {
+            "levels_recalculated": recalculated,
+            "outcomes_changed":    result["updated"],
+            "hits":                result["hits"],
+            "t1_hits":             result["t1_hits"],
+            "misses":              result["misses"],
+            "pending":             result["pending"],
+            "failed":              result["failed"],
+        }
+    except Exception as e:
+        log.exception(f"recalculate_levels: failed — {e}")
+        raise
+
 
 @app.post("/api/screen/run")
 def manual_run(background_tasks: BackgroundTasks):
