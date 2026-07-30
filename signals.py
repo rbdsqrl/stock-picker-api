@@ -137,6 +137,15 @@ SIGNAL_WEIGHTS = {
 NEWS_WEIGHT = 0.10           # Applied post-hoc to top 10 ready candidates
 WATCHLIST_NEWS_WEIGHT = 0.10 # Applied post-hoc to top watchlist candidates
 
+# ── Risk / target policy ─────────────────────────────────────────────────────
+# The stop is sized in ATR units, not percent. A flat 5% cap used to put the
+# median stop ~1 ATR from entry — inside the stock's own daily range — so routine
+# chop stopped picks out before the thesis had room to play. 2 ATR sits outside
+# that noise band; MAX_RISK_PCT only bounds the worst case on very volatile names.
+STOP_ATR_MULT  = 2.0    # stop this many ATRs below entry
+MAX_RISK_PCT   = 9.0    # hard ceiling on risk per pick
+MIN_TARGET_PCT = 12.0   # floor on upside; also the screener's candidate gate
+
 # Weights for the early / leading-indicator watchlist tier
 EARLY_SIGNAL_WEIGHTS = {
     "higher_lows":      0.25,  # ascending support toward 52W high — strongest breakout predictor
@@ -262,11 +271,12 @@ def compute_trade_levels(close: pd.Series, high: pd.Series, low: pd.Series) -> d
     """
     ATR-calibrated entry, stop, and target levels.
 
-    Stop Loss  — 2× ATR below CMP, floored at 5-day swing low, capped at 5% max risk.
-                 5% cap prevents the old 10% floor from creating terrible R:R setups.
-    Target     — 2× the actual risk (guaranteed 1:2 R:R). No 52W high cap — that cap
-                 was squashing targets to <3% while stops stayed at 10%, inverting R:R.
-                 52W high is noted as resistance but not used as a hard ceiling.
+    Stop Loss  — STOP_ATR_MULT × ATR below CMP, extended to the 5-day swing low when
+                 that sits lower, then capped at MAX_RISK_PCT worst-case risk. Sizing
+                 in ATR units keeps the stop outside the stock's daily noise band.
+    Target     — 2× the actual risk (1:2 R:R), floored at MIN_TARGET_PCT. No 52W high
+                 cap — that cap was squashing targets to <3% while stops stayed at 10%,
+                 inverting R:R. 52W high is noted as resistance, not a hard ceiling.
     """
     price          = float(close.iloc[-1])
     day_high       = float(high.iloc[-1])
@@ -275,17 +285,17 @@ def compute_trade_levels(close: pd.Series, high: pd.Series, low: pd.Series) -> d
     entry_cmp      = price
     entry_breakout = round(day_high * 1.002, 2)
 
-    # Stop: 2× ATR, floored at 5-day swing low, minimum 5% below entry.
-    # 5% floor ensures 1:2 R:R always yields at least 10% target.
-    stop_atr  = price - 2.0 * atr
+    # min() takes the lower of the two, so risk is never less than STOP_ATR_MULT ATRs.
+    # This is what stops a stock sitting on its 5-day low from getting a near-zero stop.
+    stop_atr  = price - STOP_ATR_MULT * atr
     swing_low = float(low.iloc[-5:].min())
-    stop_raw  = min(stop_atr, swing_low)          # lower of the two (more conservative)
-    stop_loss = round(max(stop_raw, price * 0.95), 2)  # minimum 5% below entry
+    stop_raw  = min(stop_atr, swing_low)
+    stop_loss = round(max(stop_raw, price * (1 - MAX_RISK_PCT / 100)), 2)
 
     risk = price - stop_loss
 
-    # Target: 2× risk (1:2 R:R guaranteed), minimum 10% upside (= 2× the 5% minimum stop).
-    target = round(max(price + 2.0 * risk, price * 1.10), 2)
+    # Target: 2× risk (1:2 R:R), floored at MIN_TARGET_PCT upside.
+    target = round(max(price + 2.0 * risk, price * (1 + MIN_TARGET_PCT / 100)), 2)
 
     rr          = round((target - price) / risk, 2) if risk > 0 else 2.0
     stop_pct    = round((price - stop_loss) / price * 100, 1)
@@ -549,10 +559,11 @@ def passes_liquidity(volume: pd.Series, close: pd.Series, min_value_cr=5.0) -> b
 
 def _fundamental_upside_pct(fundamentals: dict) -> float:
     """
-    Returns a minimum target floor in percent (10–15) driven by fundamental quality.
-    Base is 10% (matching the 1:2 R:R minimum with a 5% stop); strong metrics push higher.
+    Returns a minimum target floor in percent (12–18) driven by fundamental quality.
+    Base is MIN_TARGET_PCT (the 1:2 R:R minimum against a 2-ATR stop); strong metrics
+    push higher, because a wider stop needs more upside to stay worth taking.
     """
-    pct = 10.0
+    pct = MIN_TARGET_PCT
 
     earn_g = fundamentals.get("earnings_growth")
     rev_g  = fundamentals.get("rev_growth")
@@ -579,7 +590,7 @@ def _fundamental_upside_pct(fundamentals: dict) -> float:
         if de < 0.3:  pct += 0.5
         elif de > 2:  pct -= 1.0
 
-    return min(pct, 15.0)
+    return min(pct, 18.0)
 
 
 def _apply_target(r: dict, new_target: float) -> None:
@@ -882,7 +893,7 @@ def screen_stock_combined(ticker: str, bench_close: pd.Series, _retry: bool = Tr
                 s_rs     * SIGNAL_WEIGHTS["rel_strength"]
             )
 
-            if main_score > 0 and trade.get("target_pct", 0) >= 10.0:
+            if main_score > 0 and trade.get("target_pct", 0) >= MIN_TARGET_PCT:
                 return {
                     **base,
                     "score": round(main_score, 4),
@@ -1145,15 +1156,16 @@ def run_screening(log_cb=None, abort_event=None) -> list[dict]:
         emit("No results from screening.")
         return []
 
-    results.sort(key=lambda x: x["score"], reverse=True)
-    # Require positive score AND at least 6% upside to target
+    # Rank by score, then by upside — among equally-scored setups, take the one
+    # with more room to run rather than whichever happened to sort first.
+    results.sort(key=lambda x: (x["score"], x.get("target_pct", 0)), reverse=True)
     candidates = [
         r for r in results
-        if r["score"] > 0 and r.get("target_pct", 0) >= 6.0
+        if r["score"] > 0 and r.get("target_pct", 0) >= MIN_TARGET_PCT
     ][:10]
 
     if not candidates:
-        emit("No stock met minimum score + 6% target threshold today.")
+        emit(f"No stock met minimum score + {MIN_TARGET_PCT:.0f}% target threshold today.")
         return []
 
     # Fetch news for top 10 candidates and fold into score
@@ -1246,8 +1258,9 @@ def run_screening_combined(log_cb=None, abort_event=None) -> tuple[list[dict], l
         return [], []
 
     # ── Ready picks (top 5) ───────────────────────────────────────────────────
-    ready_candidates.sort(key=lambda x: x["score"], reverse=True)
-    candidates = [r for r in ready_candidates if r.get("target_pct", 0) >= 10.0][:15]
+    # Score first, upside as the tiebreak — prefer the setup with more room to run.
+    ready_candidates.sort(key=lambda x: (x["score"], x.get("target_pct", 0)), reverse=True)
+    candidates = [r for r in ready_candidates if r.get("target_pct", 0) >= MIN_TARGET_PCT][:15]
 
     if candidates:
         emit(f"Fetching news for top {len(candidates)} candidates...")
@@ -1262,7 +1275,7 @@ def run_screening_combined(log_cb=None, abort_event=None) -> tuple[list[dict], l
                 r["fundamental_floor_pct"] = round(r.get("fundamental_floor_pct", 10.0) + 1.0, 1)
             if articles:
                 emit(f"  {sym}: {len(articles)} article(s), sentiment {'+' if sentiment > 0 else ''}{sentiment}")
-        candidates.sort(key=lambda x: x["score"], reverse=True)
+        candidates.sort(key=lambda x: (x["score"], x.get("target_pct", 0)), reverse=True)
 
     from database import get_recently_picked_tickers
     recent = get_recently_picked_tickers(days=3)

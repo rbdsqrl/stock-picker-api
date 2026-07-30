@@ -226,11 +226,16 @@ def check_and_update_target_hits(force: bool = False) -> dict:
     """Resolve each pick into hit / miss / still-pending.
 
     A pick counts as a MISS when either:
-      * the stop loss was touched before the target was reached, or
-      * 45 days passed with neither level touched.
+      * the stock CLOSED below the stop before the target was reached, or
+      * 45 days passed with neither level resolved.
 
-    On a single bar that touches both levels the SL wins — intraday order is
-    unknowable from daily OHLC, so assume the worse of the two outcomes.
+    Scoring starts the session AFTER the pick date, and the stop is judged on the
+    close rather than the intraday low. Under the old rule (intraday low, pick day
+    included) 83% of resolved picks were stop-outs, and 46% of those were dated on
+    the pick day itself — i.e. price action that preceded the call.
+
+    On a bar that both closes below the stop and tags the target the SL wins —
+    intraday order is unknowable from daily OHLC, so assume the worse outcome.
 
     Levels are read as stored — entry, target and stop are anchored to the date
     the call was given and are never recomputed here.
@@ -278,27 +283,38 @@ def check_and_update_target_hits(force: bool = False) -> dict:
             if df.empty:
                 continue
 
-            bar_dates = [d.date() for d in df.index.tz_convert(None).normalize().to_pydatetime()]
+            # tz_localize(None) drops the tz keeping IST wall time. tz_convert(None)
+            # would shift to UTC first, turning a 00:00 IST bar into 18:30 the previous
+            # day and dating every hit/SL one calendar day early.
+            bar_dates = [d.date() for d in df.index.tz_localize(None).normalize().to_pydatetime()]
 
             df = df.reset_index(drop=True)
             df["_bar_date"] = bar_dates
-            for col in ("High", "Low"):
+            for col in ("High", "Low", "Close"):
                 df[col] = pd.to_numeric(df[col], errors="coerce")
-            df = df.dropna(subset=["High", "Low"])
+            df = df.dropna(subset=["High", "Low", "Close"])
             if df.empty:
                 continue
 
             # Plain lists keep bar dates aligned with prices after the dropna above
-            dates = list(df["_bar_date"])
-            highs = df["High"].tolist()
-            lows  = df["Low"].tolist()
+            dates  = list(df["_bar_date"])
+            highs  = df["High"].tolist()
+            closes = df["Close"].tolist()
 
-            # Scan day-by-day: whichever level is touched first decides the outcome
+            # The pick is generated from the pick-day bar itself, so scoring against
+            # that same bar tests the call on price action that preceded it. Start
+            # from the next session.
+            start_i = 1 if dates and dates[0] == picked_on else 0
+
+            # Scan day-by-day: whichever level is resolved first decides the outcome
             target_event = None
             sl_event     = None
-            for i in range(len(dates)):
-                # SL first: on a bar touching both levels the pick is a miss, not a hit
-                if stop_loss is not None and lows[i] <= stop_loss:
+            for i in range(start_i, len(dates)):
+                # SL is judged on the CLOSE, not the intraday low: a wick through the
+                # stop that recovers by the bell is noise, not a broken thesis. SL is
+                # checked first so a bar that both closes below stop and tags the
+                # target counts as a miss.
+                if stop_loss is not None and closes[i] <= stop_loss:
                     sl_event = dates[i]
                     break
                 if highs[i] >= target:
