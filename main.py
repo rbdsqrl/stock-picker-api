@@ -8,7 +8,7 @@ import logging
 import os
 from datetime import datetime
 from signals import run_screening, run_screening_combined
-from database import init_db, get_today_picks, get_today_watchlist, get_history, get_watchlist_history, save_pick, save_watchlist_picks, update_outcome, check_and_update_target_hits, recalculate_all_levels
+from database import init_db, get_today_picks, get_today_watchlist, get_history, get_watchlist_history, save_pick, save_watchlist_picks, update_outcome, check_and_update_target_hits
 
 log = logging.getLogger(__name__)
 
@@ -94,12 +94,29 @@ def history():
 
 @app.post("/api/pick/refresh-outcomes")
 async def refresh_outcomes():
+    """Re-score past picks against the levels they were published with.
+
+    This deliberately does NOT recalculate entry/target/stop. Those are anchored
+    to the date the call was given — rewriting them retroactively would score the
+    track record against moving goalposts. recalculate_all_levels() still exists
+    as a one-off backfill tool but is not wired to any endpoint.
+    """
     log.info("refresh_outcomes: started")
     try:
-        recalculated = await asyncio.to_thread(recalculate_all_levels)
-        result       = await asyncio.to_thread(check_and_update_target_hits)
-        log.info(f"refresh_outcomes: done — recalculated={recalculated} hits={result['updated']} failed={result['failed']}")
-        return {"recalculated": recalculated, "hits_updated": result["updated"], "failed": result["failed"]}
+        # force=True re-resolves picks that already have an outcome, so the
+        # SL-before-target rule is applied to rows scored under the old logic.
+        result = await asyncio.to_thread(check_and_update_target_hits, True)
+        log.info(
+            f"refresh_outcomes: done — changed={result['updated']} hits={result['hits']} "
+            f"misses={result['misses']} pending={result['pending']} failed={result['failed']}"
+        )
+        return {
+            "hits_updated": result["updated"],
+            "hits":         result["hits"],
+            "misses":       result["misses"],
+            "pending":      result["pending"],
+            "failed":       result["failed"],
+        }
     except Exception as e:
         log.exception(f"refresh_outcomes: failed — {e}")
         raise

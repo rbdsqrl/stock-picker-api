@@ -222,7 +222,24 @@ def get_history(limit=30) -> list[dict]:
         conn.close()
 
 
-def check_and_update_target_hits() -> dict:
+def check_and_update_target_hits(force: bool = False) -> dict:
+    """Resolve each pick into hit / miss / still-pending.
+
+    A pick counts as a MISS when either:
+      * the stop loss was touched before the target was reached, or
+      * 45 days passed with neither level touched.
+
+    On a single bar that touches both levels the SL wins — intraday order is
+    unknowable from daily OHLC, so assume the worse of the two outcomes.
+
+    Levels are read as stored — entry, target and stop are anchored to the date
+    the call was given and are never recomputed here.
+
+    force=True re-resolves picks that already carry an outcome (and clears it
+    back to pending if the data now says so). The manual refresh uses this so
+    rows scored under the old target-wins-ties logic get corrected; the daily
+    scheduled run stays incremental.
+    """
     import yfinance as yf
     import pandas as pd
 
@@ -230,16 +247,20 @@ def check_and_update_target_hits() -> dict:
     conn = get_conn()
     try:
         cur = _cur(conn)
+        pending_only = "" if force else "target_hit IS NULL AND "
         cur.execute(
-            "SELECT id, ticker, date, target, stop_loss FROM picks "
-            "WHERE target_hit IS NULL AND target IS NOT NULL AND date <= %s",
+            "SELECT id, ticker, date, target, stop_loss, target_hit, sl_hit FROM picks "
+            f"WHERE {pending_only}target IS NOT NULL AND date <= %s",
             (today.isoformat(),),
         )
         rows = cur.fetchall()
     finally:
         conn.close()
 
-    updated = 0
+    changed = 0
+    hits    = 0
+    misses  = 0
+    pending = 0
     failed  = []
 
     for row in rows:
@@ -248,7 +269,8 @@ def check_and_update_target_hits() -> dict:
         pick_date  = row["date"]
         target     = row["target"]
         stop_loss  = row["stop_loss"]
-        days_since = (today - date_type.fromisoformat(pick_date)).days
+        picked_on  = date_type.fromisoformat(pick_date)
+        days_since = (today - picked_on).days
 
         try:
             fetch_end = (today + timedelta(days=1)).isoformat()
@@ -256,68 +278,89 @@ def check_and_update_target_hits() -> dict:
             if df.empty:
                 continue
 
-            row_dates = df.index.tz_convert(None).normalize().to_pydatetime()
-            row_dates = [d.date() for d in row_dates]
+            bar_dates = [d.date() for d in df.index.tz_convert(None).normalize().to_pydatetime()]
 
             df = df.reset_index(drop=True)
-            for col in ("High", "Low", "Close"):
+            df["_bar_date"] = bar_dates
+            for col in ("High", "Low"):
                 df[col] = pd.to_numeric(df[col], errors="coerce")
             df = df.dropna(subset=["High", "Low"])
             if df.empty:
                 continue
 
-            # Scan day-by-day: whichever event (target or SL) happens first wins
+            # Plain lists keep bar dates aligned with prices after the dropna above
+            dates = list(df["_bar_date"])
+            highs = df["High"].tolist()
+            lows  = df["Low"].tolist()
+
+            # Scan day-by-day: whichever level is touched first decides the outcome
             target_event = None
             sl_event     = None
-            for i in range(len(df)):
-                high  = df["High"].iloc[i]
-                low   = df["Low"].iloc[i]
-                close = df["Close"].fillna(high).iloc[i]
-                d     = row_dates[i]
-
-                target_today = high >= target or close >= target
-                sl_today     = stop_loss is not None and low <= stop_loss
-
-                if target_today and not sl_event:
-                    target_event = d
+            for i in range(len(dates)):
+                # SL first: on a bar touching both levels the pick is a miss, not a hit
+                if stop_loss is not None and lows[i] <= stop_loss:
+                    sl_event = dates[i]
                     break
-                if sl_today and not target_event:
-                    sl_event = d
+                if highs[i] >= target:
+                    target_event = dates[i]
                     break
+
+            if target_event:
+                outcome  = (1, target_event.isoformat(), (target_event - picked_on).days, 0, None, None)
+                verdict  = f"Target hit: {ticker} pick={pick_date} hit={target_event} days={outcome[2]}"
+                hits    += 1
+            elif sl_event:
+                outcome  = (0, None, None, 1, sl_event.isoformat(), (sl_event - picked_on).days)
+                verdict  = f"SL hit before target: {ticker} pick={pick_date} sl={sl_event} days={outcome[5]}"
+                misses  += 1
+            elif days_since > 45:
+                outcome  = (0, None, None, 0, None, None)
+                verdict  = f"Target missed (45d expired): {ticker} pick={pick_date}"
+                misses  += 1
+            else:
+                outcome  = (None, None, None, None, None, None)
+                verdict  = None
+                pending += 1
+
+            if (row["target_hit"], row["sl_hit"]) == (outcome[0], outcome[3]):
+                continue  # already resolved this way — nothing to write
 
             c = get_conn()
             try:
                 cur2 = _cur(c)
-                if target_event:
-                    hit_days = (target_event - date_type.fromisoformat(pick_date)).days
-                    cur2.execute(
-                        "UPDATE picks SET target_hit=1, target_hit_date=%s, target_hit_days=%s WHERE id=%s",
-                        (target_event.isoformat(), hit_days, pick_id),
-                    )
-                    log.info(f"Target hit: {ticker} pick={pick_date} hit={target_event} days={hit_days}")
-                elif sl_event:
-                    sl_days = (sl_event - date_type.fromisoformat(pick_date)).days
-                    cur2.execute(
-                        "UPDATE picks SET target_hit=0, sl_hit=1, sl_hit_date=%s, sl_hit_days=%s WHERE id=%s",
-                        (sl_event.isoformat(), sl_days, pick_id),
-                    )
-                    log.info(f"SL hit: {ticker} pick={pick_date} sl={sl_event} days={sl_days}")
-                elif days_since > 45:
-                    cur2.execute("UPDATE picks SET target_hit=0 WHERE id=%s", (pick_id,))
-                    log.info(f"Target missed (45d expired): {ticker} pick={pick_date}")
+                cur2.execute(
+                    "UPDATE picks SET target_hit=%s, target_hit_date=%s, target_hit_days=%s, "
+                    "sl_hit=%s, sl_hit_date=%s, sl_hit_days=%s WHERE id=%s",
+                    (*outcome, pick_id),
+                )
                 c.commit()
-                updated += 1
+                changed += 1
             finally:
                 c.close()
+
+            log.info(verdict or f"Outcome cleared (pending): {ticker} pick={pick_date}")
 
         except Exception as e:
             log.warning(f"check_target_hits: {ticker} failed — {e}")
             failed.append(row["ticker"])
 
-    return {"updated": updated, "failed": failed}
+    return {
+        "updated": changed,
+        "hits":    hits,
+        "misses":  misses,
+        "pending": pending,
+        "failed":  failed,
+    }
 
 
 def recalculate_all_levels() -> int:
+    """One-off backfill: rewrite entry_breakout/stop/target on historical picks.
+
+    NOT wired to any endpoint on purpose. These levels are anchored to the date
+    the call was given, so rewriting them retroactively rescores the track record
+    against goalposts the pick never actually had. Run manually only, to repair
+    rows that were saved with genuinely broken levels.
+    """
     import yfinance as yf
     import pandas as pd
     from signals import compute_trade_levels
