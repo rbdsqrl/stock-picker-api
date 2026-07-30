@@ -55,10 +55,15 @@ def init_db():
                 stop_pct        REAL,
                 target          REAL,
                 target_pct      REAL,
+                target_short     REAL,
+                target_short_pct REAL,
                 entry_breakout  REAL,
                 atr_14          REAL,
                 rr_ratio        REAL,
                 target_days_est INTEGER,
+                target_short_hit      INTEGER,
+                target_short_hit_date TEXT,
+                target_short_hit_days INTEGER,
                 target_hit            INTEGER,
                 target_hit_date       TEXT,
                 target_hit_days       INTEGER,
@@ -123,12 +128,19 @@ def init_db():
             ("sl_hit",                "INTEGER"),
             ("sl_hit_date",           "TEXT"),
             ("sl_hit_days",           "INTEGER"),
+            ("target_short",          "REAL"),
+            ("target_short_pct",      "REAL"),
+            ("target_short_hit",      "INTEGER"),
+            ("target_short_hit_date", "TEXT"),
+            ("target_short_hit_days", "INTEGER"),
         ]:
             cur.execute(f"ALTER TABLE picks ADD COLUMN IF NOT EXISTS {col} {typedef}")
 
         for col, typedef in [
-            ("news",           "TEXT"),
-            ("news_sentiment", "INTEGER"),
+            ("news",             "TEXT"),
+            ("news_sentiment",   "INTEGER"),
+            ("target_short",     "REAL"),
+            ("target_short_pct", "REAL"),
         ]:
             cur.execute(f"ALTER TABLE watchlist_picks ADD COLUMN IF NOT EXISTS {col} {typedef}")
 
@@ -146,10 +158,10 @@ def save_pick(pick: dict, rank: int = 1):
             INSERT INTO picks
             (date, rank, ticker, company, sector, price_at_pick,
              score, signals, rationale, news, fundamentals,
-             stop_loss, stop_pct, target, target_pct,
+             stop_loss, stop_pct, target, target_pct, target_short, target_short_pct,
              entry_breakout, atr_14, rr_ratio, target_days_est,
              fundamental_floor_pct)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (date, rank) DO UPDATE SET
                 ticker                = EXCLUDED.ticker,
                 company               = EXCLUDED.company,
@@ -164,6 +176,8 @@ def save_pick(pick: dict, rank: int = 1):
                 stop_pct              = EXCLUDED.stop_pct,
                 target                = EXCLUDED.target,
                 target_pct            = EXCLUDED.target_pct,
+                target_short          = EXCLUDED.target_short,
+                target_short_pct      = EXCLUDED.target_short_pct,
                 entry_breakout        = EXCLUDED.entry_breakout,
                 atr_14                = EXCLUDED.atr_14,
                 rr_ratio              = EXCLUDED.rr_ratio,
@@ -184,6 +198,8 @@ def save_pick(pick: dict, rank: int = 1):
             pick.get("stop_pct"),
             pick.get("target"),
             pick.get("target_pct"),
+            pick.get("target_short"),
+            pick.get("target_short_pct"),
             pick.get("entry_breakout"),
             pick.get("atr_14"),
             pick.get("rr_ratio"),
@@ -226,8 +242,11 @@ def check_and_update_target_hits(force: bool = False) -> dict:
     """Resolve each pick into hit / miss / still-pending.
 
     A pick counts as a MISS when either:
-      * the stock CLOSED below the stop before the target was reached, or
+      * the stock CLOSED below the stop before the long target was reached, or
       * 45 days passed with neither level resolved.
+
+    The short target (T1, 1R) is tracked alongside but never resolves a pick — it
+    is an early read that the move is underway while T2 is still in play.
 
     Scoring starts the session AFTER the pick date, and the stop is judged on the
     close rather than the intraday low. Under the old rule (intraday low, pick day
@@ -254,7 +273,8 @@ def check_and_update_target_hits(force: bool = False) -> dict:
         cur = _cur(conn)
         pending_only = "" if force else "target_hit IS NULL AND "
         cur.execute(
-            "SELECT id, ticker, date, target, stop_loss, target_hit, sl_hit FROM picks "
+            "SELECT id, ticker, date, target, target_short, stop_loss, "
+            "target_hit, sl_hit, target_short_hit FROM picks "
             f"WHERE {pending_only}target IS NOT NULL AND date <= %s",
             (today.isoformat(),),
         )
@@ -264,6 +284,7 @@ def check_and_update_target_hits(force: bool = False) -> dict:
 
     changed = 0
     hits    = 0
+    t1_hits = 0
     misses  = 0
     pending = 0
     failed  = []
@@ -273,6 +294,7 @@ def check_and_update_target_hits(force: bool = False) -> dict:
         ticker     = row["ticker"] + ".NS"
         pick_date  = row["date"]
         target     = row["target"]
+        target_s   = row["target_short"]
         stop_loss  = row["stop_loss"]
         picked_on  = date_type.fromisoformat(pick_date)
         days_since = (today - picked_on).days
@@ -306,10 +328,15 @@ def check_and_update_target_hits(force: bool = False) -> dict:
             # from the next session.
             start_i = 1 if dates and dates[0] == picked_on else 0
 
-            # Scan day-by-day: whichever level is resolved first decides the outcome
+            # Scan day-by-day: whichever level is resolved first decides the outcome.
+            # T1 is recorded in passing and never breaks the loop — it is early
+            # confirmation the move is underway, not an exit.
             target_event = None
             sl_event     = None
+            t1_event     = None
             for i in range(start_i, len(dates)):
+                if t1_event is None and target_s is not None and highs[i] >= target_s:
+                    t1_event = dates[i]
                 # SL is judged on the CLOSE, not the intraday low: a wick through the
                 # stop that recovers by the bell is noise, not a broken thesis. SL is
                 # checked first so a bar that both closes below stop and tags the
@@ -338,7 +365,13 @@ def check_and_update_target_hits(force: bool = False) -> dict:
                 verdict  = None
                 pending += 1
 
-            if (row["target_hit"], row["sl_hit"]) == (outcome[0], outcome[3]):
+            t1 = ((1, t1_event.isoformat(), (t1_event - picked_on).days)
+                  if t1_event else (0 if target_s is not None else None, None, None))
+            if t1_event:
+                t1_hits += 1
+
+            prev = (row["target_hit"], row["sl_hit"], row["target_short_hit"])
+            if prev == (outcome[0], outcome[3], t1[0]):
                 continue  # already resolved this way — nothing to write
 
             c = get_conn()
@@ -346,8 +379,10 @@ def check_and_update_target_hits(force: bool = False) -> dict:
                 cur2 = _cur(c)
                 cur2.execute(
                     "UPDATE picks SET target_hit=%s, target_hit_date=%s, target_hit_days=%s, "
-                    "sl_hit=%s, sl_hit_date=%s, sl_hit_days=%s WHERE id=%s",
-                    (*outcome, pick_id),
+                    "sl_hit=%s, sl_hit_date=%s, sl_hit_days=%s, "
+                    "target_short_hit=%s, target_short_hit_date=%s, target_short_hit_days=%s "
+                    "WHERE id=%s",
+                    (*outcome, *t1, pick_id),
                 )
                 c.commit()
                 changed += 1
@@ -363,6 +398,7 @@ def check_and_update_target_hits(force: bool = False) -> dict:
     return {
         "updated": changed,
         "hits":    hits,
+        "t1_hits": t1_hits,
         "misses":  misses,
         "pending": pending,
         "failed":  failed,

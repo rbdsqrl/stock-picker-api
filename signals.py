@@ -140,11 +140,21 @@ WATCHLIST_NEWS_WEIGHT = 0.10 # Applied post-hoc to top watchlist candidates
 # ── Risk / target policy ─────────────────────────────────────────────────────
 # The stop is sized in ATR units, not percent. A flat 5% cap used to put the
 # median stop ~1 ATR from entry — inside the stock's own daily range — so routine
-# chop stopped picks out before the thesis had room to play. 2 ATR sits outside
-# that noise band; MAX_RISK_PCT only bounds the worst case on very volatile names.
-STOP_ATR_MULT  = 2.0    # stop this many ATRs below entry
+# chop stopped picks out before the thesis had room to play.
+#
+# 1.5 ATR comes from an MAE study over picks with a full 10-day horizon: every
+# eventual winner's worst drawdown was <= 1.46 ATR (p90 1.09), while the MEDIAN
+# non-winner fell 1.98 ATR. So 1.5 keeps the winners whole and exits the losers
+# sooner than 2.0 did. MAX_RISK_PCT only bounds very volatile names.
+STOP_ATR_MULT  = 1.5    # stop this many ATRs below entry
 MAX_RISK_PCT   = 9.0    # hard ceiling on risk per pick
-MIN_TARGET_PCT = 12.0   # floor on upside; also the screener's candidate gate
+MIN_TARGET_PCT = 12.0   # floor on the long target; also the screener's gate
+
+# Two-tier targets. T1 is an early-confirmation level, not an exit signal: at 1R
+# it sits near the median 10-day MFE (1.40 ATR), so roughly half of picks tag it
+# and you get a read on the thesis long before T2 resolves.
+TARGET_SHORT_R = 1.0    # short-term target, in multiples of risk
+TARGET_LONG_R  = 2.0    # long-term target, in multiples of risk
 
 # Weights for the early / leading-indicator watchlist tier
 EARLY_SIGNAL_WEIGHTS = {
@@ -294,12 +304,15 @@ def compute_trade_levels(close: pd.Series, high: pd.Series, low: pd.Series) -> d
 
     risk = price - stop_loss
 
-    # Target: 2× risk (1:2 R:R), floored at MIN_TARGET_PCT upside.
-    target = round(max(price + 2.0 * risk, price * (1 + MIN_TARGET_PCT / 100)), 2)
+    # Long target: 2× risk (1:2 R:R), floored at MIN_TARGET_PCT upside.
+    target = round(max(price + TARGET_LONG_R * risk, price * (1 + MIN_TARGET_PCT / 100)), 2)
+    # Short target: 1R. Confirmation level only — it never resolves the pick.
+    target_short = round(price + TARGET_SHORT_R * risk, 2)
 
-    rr          = round((target - price) / risk, 2) if risk > 0 else 2.0
-    stop_pct    = round((price - stop_loss) / price * 100, 1)
-    target_pct  = round((target - price)    / price * 100, 1)
+    rr                = round((target - price) / risk, 2) if risk > 0 else 2.0
+    stop_pct          = round((price - stop_loss) / price * 100, 1)
+    target_pct        = round((target - price)       / price * 100, 1)
+    target_short_pct  = round((target_short - price) / price * 100, 1)
 
     # Estimate trading days: distance / (0.5 ATR per day), clamped 5–30
     target_days_est = max(5, min(30, round((target - price) / atr * 2))) if atr > 0 else 10
@@ -307,8 +320,10 @@ def compute_trade_levels(close: pd.Series, high: pd.Series, low: pd.Series) -> d
     return {
         "entry_cmp":       round(entry_cmp, 2),
         "entry_breakout":  entry_breakout,
-        "stop_loss":       stop_loss,
-        "stop_pct":        stop_pct,
+        "stop_loss":         stop_loss,
+        "stop_pct":          stop_pct,
+        "target_short":      target_short,
+        "target_short_pct":  target_short_pct,
         "target":          target,
         "target_pct":      target_pct,
         "atr_14":          round(atr, 2),

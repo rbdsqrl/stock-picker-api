@@ -108,11 +108,13 @@ async def refresh_outcomes():
         result = await asyncio.to_thread(check_and_update_target_hits, True)
         log.info(
             f"refresh_outcomes: done — changed={result['updated']} hits={result['hits']} "
-            f"misses={result['misses']} pending={result['pending']} failed={result['failed']}"
+            f"t1={result['t1_hits']} misses={result['misses']} pending={result['pending']} "
+            f"failed={result['failed']}"
         )
         return {
             "hits_updated": result["updated"],
             "hits":         result["hits"],
+            "t1_hits":      result["t1_hits"],
             "misses":       result["misses"],
             "pending":      result["pending"],
             "failed":       result["failed"],
