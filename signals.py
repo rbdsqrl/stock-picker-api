@@ -733,6 +733,68 @@ def screen_stock(ticker: str, bench_close: pd.Series) -> dict | None:
 
 # ── Interpretation generators ────────────────────────────────────────────────
 
+_SCORE_LABELS = {
+    "trend":        "trend",
+    "momentum":     "momentum",
+    "volume":       "volume",
+    "breakout":     "breakout",
+    "rel_strength": "rel strength",
+}
+
+
+def generate_score_basis(result: dict) -> str:
+    """One line showing where the composite score came from.
+
+    The score is a weighted sum of five ±1 signals, so the honest justification is
+    the arithmetic itself: which signals fired, what each was worth, and what held
+    it back. Reads off the stored signals, so it also works for historical picks.
+    """
+    signals = result.get("signals") or {}
+    if not isinstance(signals, dict):
+        return ""
+
+    contrib = []
+    for key, weight in SIGNAL_WEIGHTS.items():
+        block = signals.get(key)
+        raw   = block.get("score") if isinstance(block, dict) else None
+        if raw is None:
+            continue
+        contrib.append((_SCORE_LABELS.get(key, key), raw * weight, raw))
+    if not contrib:
+        return ""
+
+    contrib.sort(key=lambda c: -c[1])
+    up   = [f"{n} {v:+.2f}" for n, v, r in contrib if r > 0]
+    down = [f"{n} {v:+.2f}" for n, v, r in contrib if r < 0]
+    flat = [n for n, v, r in contrib if r == 0]
+
+    bits = []
+    if up:   bits.append("lifted by " + ", ".join(up))
+    if down: bits.append("dragged by " + ", ".join(down))
+    if flat: bits.append("neutral on " + ", ".join(flat))
+
+    total     = sum(v for _, v, _ in contrib)
+    sentiment = result.get("news_sentiment")
+    if sentiment:
+        news_contrib = sentiment * NEWS_WEIGHT
+        total += news_contrib
+        bits.append(f"news sentiment {news_contrib:+.2f}")
+
+    tail  = f" {len(up)} of {len(contrib)} signals positive."
+    score = result.get("score")
+    if not isinstance(score, (int, float)):
+        return f"Score {total:+.2f} of a possible +1.00 — {'; '.join(bits)}.{tail}"
+
+    # Signal weights have been rebalanced over time, so a pick scored under the old
+    # weights will not reconcile with a breakdown computed at today's. Say so rather
+    # than printing components that visibly fail to add up to the recorded score.
+    if abs(total - score) < 0.005:
+        head = f"Score {score:+.2f} of a possible +1.00"
+        return f"{head} — {'; '.join(bits)}.{tail}"
+    return (f"Score {score:+.2f} as recorded; these signals sum to {total:+.2f} at today's "
+            f"weights — {'; '.join(bits)}.{tail}")
+
+
 def generate_rationale(result: dict) -> str:
     s = result["signals"]
     parts = []
@@ -1107,6 +1169,7 @@ def analyse_stock(ticker_sym: str) -> dict:
             "sector":         sector,
             "price":          round(price, 2),
             "score":          round(composite, 4),
+            "score_basis":    "",   # filled in below, once signals are assembled
             "news_sentiment": sentiment,
             "signals": {
                 "trend":        {"score": s_trend, **d_trend},
@@ -1132,7 +1195,8 @@ def analyse_stock(ticker_sym: str) -> dict:
             "news":    articles,
             **trade,
         }
-        result["rationale"] = generate_rationale(result)
+        result["rationale"]   = generate_rationale(result)
+        result["score_basis"] = generate_score_basis(result)
         return result
 
     except (Exception, SystemError) as e:

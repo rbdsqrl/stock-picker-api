@@ -648,6 +648,7 @@ def update_outcome(pick_date: str, outcome_price: float):
 
 
 def _row_to_dict(row):
+    from signals import generate_score_basis
     d = dict(row)
     for field in ("signals", "news", "fundamentals"):
         if d.get(field):
@@ -657,4 +658,7 @@ def _row_to_dict(row):
                 pass
     d["price"]     = d.get("price_at_pick")
     d["entry_cmp"] = d.get("price_at_pick")
+    # Derived on read from the stored signals rather than persisted: historical picks
+    # get the explanation too, and it can never drift from the score it describes.
+    d["score_basis"] = generate_score_basis(d)
     return d
