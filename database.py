@@ -133,6 +133,7 @@ def init_db():
             ("target_short_hit",      "INTEGER"),
             ("target_short_hit_date", "TEXT"),
             ("target_short_hit_days", "INTEGER"),
+            ("valuation",             "TEXT"),
         ]:
             cur.execute(f"ALTER TABLE picks ADD COLUMN IF NOT EXISTS {col} {typedef}")
 
@@ -160,8 +161,8 @@ def save_pick(pick: dict, rank: int = 1):
              score, signals, rationale, news, fundamentals,
              stop_loss, stop_pct, target, target_pct, target_short, target_short_pct,
              entry_breakout, atr_14, rr_ratio, target_days_est,
-             fundamental_floor_pct)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+             fundamental_floor_pct, valuation)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (date, rank) DO UPDATE SET
                 ticker                = EXCLUDED.ticker,
                 company               = EXCLUDED.company,
@@ -182,7 +183,8 @@ def save_pick(pick: dict, rank: int = 1):
                 atr_14                = EXCLUDED.atr_14,
                 rr_ratio              = EXCLUDED.rr_ratio,
                 target_days_est       = EXCLUDED.target_days_est,
-                fundamental_floor_pct = EXCLUDED.fundamental_floor_pct
+                fundamental_floor_pct = EXCLUDED.fundamental_floor_pct,
+                valuation             = EXCLUDED.valuation
         """, (
             today, rank,
             pick["ticker"],
@@ -205,6 +207,7 @@ def save_pick(pick: dict, rank: int = 1):
             pick.get("rr_ratio"),
             pick.get("target_days_est"),
             pick.get("fundamental_floor_pct"),
+            json.dumps(pick.get("valuation", {})),
         ))
         conn.commit()
     finally:
@@ -650,7 +653,7 @@ def update_outcome(pick_date: str, outcome_price: float):
 def _row_to_dict(row):
     from signals import generate_score_basis
     d = dict(row)
-    for field in ("signals", "news", "fundamentals"):
+    for field in ("signals", "news", "fundamentals", "valuation"):
         if d.get(field):
             try:
                 d[field] = json.loads(d[field])

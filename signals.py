@@ -23,6 +23,7 @@ import ssl
 import certifi
 import io
 import time
+import statistics
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -685,6 +686,7 @@ def screen_stock(ticker: str, bench_close: pd.Series) -> dict | None:
         fundamentals = {
             "market_cap_cr":    round(cap_raw / 1e7) if cap_raw else None,
             "pe":               round(info["trailingPE"], 1) if info.get("trailingPE") else None,
+            "price_to_book":    round(info["priceToBook"], 2) if info.get("priceToBook") else None,
             "pe_fwd":           round(info["forwardPE"], 1)  if info.get("forwardPE")  else None,
             "eps":              round(info["trailingEps"], 2) if info.get("trailingEps") else None,
             "rev_growth":       _pct(info.get("revenueGrowth")),
@@ -732,6 +734,235 @@ def screen_stock(ticker: str, bench_close: pd.Series) -> dict | None:
         return None
 
 # ── Interpretation generators ────────────────────────────────────────────────
+
+# ── Stage 2: valuation deep-dive ─────────────────────────────────────────────
+# Runs only on the shortlist, not the whole universe — it needs statements, which
+# cost an extra fetch per stock. Everything here is derived from data yfinance
+# actually returns for NSE names (verified: priceToBook, bookValue, enterpriseValue,
+# marketCap, totalCash, totalDebt, trailing/forwardPE, income_stmt, balance_sheet).
+#
+# Deliberately NOT modelled: order books, management guidance, credit ratings,
+# promoter-stake changes, segment splits. None of those are in any feed we have,
+# and holder percentages that yfinance does return are unreliable for Indian
+# stocks, so they are not used to draw conclusions.
+_CR = 1e7   # 1 crore
+PEER_MIN_N = 8   # cohort size below which a peer median is too noisy to price off
+
+def _stmt_row(df, *names):
+    """First matching row of a yfinance statement, newest-first as a list."""
+    if df is None or getattr(df, "empty", True):
+        return []
+    for n in names:
+        if n in df.index:
+            return [None if v != v else float(v) for v in df.loc[n].values]
+    return []
+
+
+def _cagr(series: list) -> float | None:
+    """CAGR from the oldest to newest non-null value. Needs both ends positive."""
+    vals = [(i, v) for i, v in enumerate(series) if v is not None]
+    if len(vals) < 2:
+        return None
+    newest, oldest = vals[0][1], vals[-1][1]
+    years = vals[-1][0] - vals[0][0]
+    if years <= 0 or oldest <= 0 or newest <= 0:
+        return None
+    return round(((newest / oldest) ** (1 / years) - 1) * 100, 1)
+
+
+def build_peer_stats(results: list[dict]) -> dict:
+    """Median trailing PE and P/B per sector, from the screened universe.
+
+    This is the cohort the relative-value comparison is made against — the same
+    "20x vs a peer on 55x" argument, but computed rather than hand-picked.
+    """
+    by_sector: dict[str, dict[str, list]] = {}
+    for r in results:
+        sector = r.get("sector")
+        f      = r.get("fundamentals") or {}
+        if not sector or sector == "N/A":
+            continue
+        slot = by_sector.setdefault(sector, {"pe": [], "pb": []})
+        pe = f.get("pe")
+        pb = f.get("price_to_book")
+        if isinstance(pe, (int, float)) and 0 < pe < 300:
+            slot["pe"].append(pe)
+        if isinstance(pb, (int, float)) and 0 < pb < 50:
+            slot["pb"].append(pb)
+
+    out = {}
+    for sector, v in by_sector.items():
+        if len(v["pe"]) >= 3:
+            out[sector] = {
+                "pe_median": round(statistics.median(v["pe"]), 1),
+                "pb_median": round(statistics.median(v["pb"]), 2) if len(v["pb"]) >= 3 else None,
+                "n":         len(v["pe"]),
+            }
+    return out
+
+
+def compute_valuation_case(info: dict, price: float, sector: str,
+                           income_stmt=None, balance_sheet=None,
+                           peer_stats: dict | None = None) -> dict:
+    """Valuation evidence for one shortlisted stock, in the style of a written thesis.
+
+    Returns partial results rather than failing — Yahoo's coverage of Indian
+    small-caps is patchy (SAVITA.NS 404s entirely), so every field is optional and
+    the summary only asserts what actually resolved.
+    """
+    v: dict = {}
+
+    mcap = info.get("marketCap")
+    ev   = info.get("enterpriseValue")
+    cash = info.get("totalCash")
+    debt = info.get("totalDebt")
+    shares = info.get("sharesOutstanding")
+
+    v["mcap_cr"] = round(mcap / _CR) if mcap else None
+    v["ev_cr"]   = round(ev / _CR) if ev else None
+
+    # Book value — the "trading below net worth" argument
+    v["book_value"]    = round(info["bookValue"], 2) if info.get("bookValue") else None
+    v["price_to_book"] = round(info["priceToBook"], 2) if info.get("priceToBook") else None
+
+    # Net cash — the "debt-free, cash-rich" argument
+    if cash is not None and debt is not None:
+        net_cash = cash - debt
+        v["net_cash_cr"] = round(net_cash / _CR)
+        v["net_cash_per_share"] = round(net_cash / shares, 1) if shares else None
+        v["net_cash_pct_mcap"]  = round(net_cash / mcap * 100, 1) if mcap else None
+
+    # Trailing vs forward PE — the market's own re-rating expectation
+    pe_t = info.get("trailingPE")
+    pe_f = info.get("forwardPE")
+    v["pe_trailing"] = round(pe_t, 1) if isinstance(pe_t, (int, float)) else None
+    v["pe_forward"]  = round(pe_f, 1) if isinstance(pe_f, (int, float)) else None
+    v["ev_ebitda"]   = round(info["enterpriseToEbitda"], 1) if info.get("enterpriseToEbitda") else None
+
+    # Multi-year trajectory
+    rev = _stmt_row(income_stmt, "Total Revenue", "Operating Revenue")
+    pat = _stmt_row(income_stmt, "Net Income", "Net Income Common Stockholders")
+    v["rev_cagr_pct"] = _cagr(rev)
+    v["pat_cagr_pct"] = _cagr(pat)
+    if rev and pat and rev[0] and pat[0]:
+        v["net_margin_now"] = round(pat[0] / rev[0] * 100, 1)
+        older = [(r, p) for r, p in zip(rev[1:], pat[1:]) if r and p]
+        if older:
+            v["net_margin_then"] = round(older[-1][1] / older[-1][0] * 100, 1)
+    eq = _stmt_row(balance_sheet, "Stockholders Equity")
+    v["net_worth_cr"] = round(eq[0] / _CR) if eq and eq[0] else None
+
+    # Relative value against the sector cohort
+    peer = (peer_stats or {}).get(sector)
+    if peer and v["pe_trailing"]:
+        v["peer_pe_median"] = peer["pe_median"]
+        v["peer_n"]         = peer["n"]
+        v["pe_vs_peer_pct"] = round((v["pe_trailing"] / peer["pe_median"] - 1) * 100, 0)
+        # Peer-parity value: what the stock would be worth on the cohort's multiple.
+        # This is an OBSERVATION, not a target — it assumes the gap is unwarranted,
+        # which is precisely the thing that needs an argument (a rating upgrade, a
+        # promoter change, a capacity ramp) that none of our feeds can supply. Only
+        # emitted off a cohort big enough for the median to mean something.
+        if peer["n"] >= PEER_MIN_N:
+            parity = price * peer["pe_median"] / v["pe_trailing"]
+            v["peer_parity_price"] = round(parity, 2)
+            v["peer_parity_gap"]   = round((parity / price - 1) * 100, 1)
+            # A cheap multiple alongside shrinking profits is usually cheap for a
+            # reason. Say so rather than implying the gap is free money.
+            v["parity_caveat"] = (v.get("pat_cagr_pct") is not None
+                                  and v["pat_cagr_pct"] < 0)
+
+    v["summary"] = _valuation_summary(v, sector)
+    return v
+
+
+def _valuation_summary(v: dict, sector: str) -> str:
+    parts = []
+
+    pb = v.get("price_to_book")
+    if pb is not None:
+        bv = f" (book ₹{v['book_value']})" if v.get("book_value") else ""
+        if pb < 1:
+            parts.append(f"Trades at {pb}x book{bv} — below net worth.")
+        else:
+            parts.append(f"Trades at {pb}x book{bv}.")
+
+    ncp = v.get("net_cash_pct_mcap")
+    if ncp is not None:
+        if ncp > 0:
+            per = f", ₹{v['net_cash_per_share']}/share" if v.get("net_cash_per_share") else ""
+            parts.append(f"Net cash {ncp}% of mcap{per} — debt-free.")
+        else:
+            parts.append(f"Net debt {abs(ncp)}% of mcap.")
+
+    if v.get("pe_trailing") and v.get("peer_pe_median"):
+        gap  = v["pe_vs_peer_pct"]
+        word = "discount to" if gap < 0 else "premium to"
+        parts.append(f"PE {v['pe_trailing']}x vs {sector} peer median "
+                     f"{v['peer_pe_median']}x (n={v['peer_n']}) — {abs(gap):.0f}% {word} peers.")
+
+    if v.get("pe_trailing") and v.get("pe_forward") and v["pe_forward"] < v["pe_trailing"]:
+        parts.append(f"Forward PE {v['pe_forward']}x vs trailing {v['pe_trailing']}x — "
+                     f"earnings expected to grow into the multiple.")
+
+    if v.get("rev_cagr_pct") is not None and v.get("pat_cagr_pct") is not None:
+        parts.append(f"Revenue CAGR {v['rev_cagr_pct']:+.1f}%, PAT CAGR {v['pat_cagr_pct']:+.1f}%.")
+    if v.get("net_margin_now") is not None and v.get("net_margin_then") is not None:
+        d = "widening" if v["net_margin_now"] > v["net_margin_then"] else "compressing"
+        parts.append(f"Net margin {v['net_margin_then']}% → {v['net_margin_now']}% ({d}).")
+
+    if v.get("peer_parity_gap") is not None:
+        parts.append(f"At the cohort multiple it would be ₹{v['peer_parity_price']} "
+                     f"({v['peer_parity_gap']:+.1f}%) — a relative-value observation, not a "
+                     f"target, and not the ATR-based trade levels.")
+        if v.get("parity_caveat"):
+            parts.append("Profits are shrinking, so the discount may well be deserved.")
+
+    return " ".join(parts) if parts else "Insufficient valuation data from the feed."
+
+
+def enrich_valuation(shortlist: list[dict], universe: list[dict], emit=None) -> int:
+    """Run the Stage-2 valuation deep-dive over the shortlist, in place.
+
+    Statements are an extra fetch per stock, so this runs on the shortlist only —
+    never the full universe. The peer cohort, by contrast, is built from everything
+    screened, which is what makes the relative-value comparison meaningful.
+
+    Failures are per-stock and non-fatal: a missing valuation must never cost a pick.
+    """
+    def say(m):
+        log.info(m)
+        if emit:
+            emit(m)
+
+    if not shortlist:
+        return 0
+
+    peer_stats = build_peer_stats(universe)
+    say(f"Valuation deep-dive on {len(shortlist)} shortlisted "
+        f"({len(peer_stats)} sector cohorts from {len(universe)} screened)...")
+
+    done = 0
+    for r in shortlist:
+        sym = r["ticker"] + ".NS"
+        try:
+            tk   = yf.Ticker(sym)
+            info = tk.info or {}
+            if not info.get("marketCap"):
+                r["valuation"] = {"summary": "No valuation data available for this symbol."}
+                continue
+            r["valuation"] = compute_valuation_case(
+                info, r["price"], r.get("sector") or "",
+                income_stmt=tk.income_stmt, balance_sheet=tk.balance_sheet,
+                peer_stats=peer_stats,
+            )
+            done += 1
+        except (Exception, SystemError) as e:
+            log.warning(f"valuation: {sym} — {e}")
+            r["valuation"] = {"summary": "Valuation lookup failed."}
+    say(f"Valuation deep-dive complete: {done}/{len(shortlist)} resolved.")
+    return done
+
 
 _SCORE_LABELS = {
     "trend":        "trend",
@@ -923,6 +1154,7 @@ def screen_stock_combined(ticker: str, bench_close: pd.Series, _retry: bool = Tr
         fundamentals = {
             "market_cap_cr":   round(cap_raw / 1e7) if cap_raw else None,
             "pe":              round(info["trailingPE"], 1) if info.get("trailingPE") else None,
+            "price_to_book":   round(info["priceToBook"], 2) if info.get("priceToBook") else None,
             "pe_fwd":          round(info["forwardPE"], 1)  if info.get("forwardPE")  else None,
             "eps":             round(info["trailingEps"], 2) if info.get("trailingEps") else None,
             "rev_growth":      _pct(info.get("revenueGrowth")),
@@ -1197,6 +1429,15 @@ def analyse_stock(ticker_sym: str) -> dict:
         }
         result["rationale"]   = generate_rationale(result)
         result["score_basis"] = generate_score_basis(result)
+        # No peer cohort here — that is built from a full screen, so the on-demand
+        # analysis gets the absolute valuation block without the relative comparison.
+        try:
+            result["valuation"] = compute_valuation_case(
+                info, price, sector,
+                income_stmt=info_obj.income_stmt, balance_sheet=info_obj.balance_sheet,
+            )
+        except (Exception, SystemError) as e:
+            log.warning(f"analyse_stock valuation: {full_sym} — {e}")
         return result
 
     except (Exception, SystemError) as e:
@@ -1254,6 +1495,8 @@ def run_screening(log_cb=None, abort_event=None) -> list[dict]:
     if not candidates:
         emit(f"No stock met minimum score + {MIN_TARGET_PCT:.0f}% target threshold today.")
         return []
+
+    enrich_valuation(candidates, results, emit)
 
     # Fetch news for top 10 candidates and fold into score
     emit(f"Fetching news for top {len(candidates)} candidates...")
@@ -1348,6 +1591,8 @@ def run_screening_combined(log_cb=None, abort_event=None) -> tuple[list[dict], l
     # Score first, upside as the tiebreak — prefer the setup with more room to run.
     ready_candidates.sort(key=lambda x: (x["score"], x.get("target_pct", 0)), reverse=True)
     candidates = [r for r in ready_candidates if r.get("target_pct", 0) >= MIN_TARGET_PCT][:15]
+
+    enrich_valuation(candidates, ready_candidates + early_candidates, emit)
 
     if candidates:
         emit(f"Fetching news for top {len(candidates)} candidates...")
