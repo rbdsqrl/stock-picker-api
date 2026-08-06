@@ -1026,49 +1026,314 @@ def generate_score_basis(result: dict) -> str:
             f"weights — {'; '.join(bits)}.{tail}")
 
 
+# ── Rationale: the written call ──────────────────────────────────────────────
+# This used to emit one canned sentence per firing signal, which meant every pick
+# read identically and none of them committed to anything. A call is only worth
+# reading if it names the setup, says what triggered it *now*, grades its own
+# confidence against the evidence, and states the price that proves it wrong.
+# Each helper below writes one of those beats.
+#
+# Conviction here means falsifiability, not volume: the tier is earned by counting
+# evidence, and every call carries the level that kills it. Everything is read
+# defensively off `result` — the plain screen_stock() path attaches no news or
+# valuation block, and analyse_stock() fills valuation in only after this runs.
+
+# Lenders carry structurally high debt/equity; flagging it there is noise.
+_FINANCIAL_SECTORS = {"Financial Services", "Financials", "Financial", "Banks"}
+
+
+def _num(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _join(items: list[str]) -> str:
+    """Join clauses readably. Several of these carry their own commas and dashes,
+    so comma-joining them runs the list together into one unparseable sentence."""
+    if len(items) == 1:
+        return items[0]
+    sep = "; " if any("," in i for i in items) else ", "
+    return sep.join(items[:-1]) + sep.strip() + " and " + items[-1]
+
+
+def _conviction_evidence(result: dict) -> tuple[int, list[tuple[str, str]], list[str]]:
+    """Weigh the evidence for and against the call.
+
+    Returns a point total plus the arguments on each side, so the written call can
+    put its own case and then argue against itself in the same breath. Supporting
+    arguments are tagged so the caller can drop any the lead or trigger already made
+    — repeating the same fact three times reads as padding, not as conviction.
+    """
+    s      = result.get("signals") or {}
+    f      = result.get("fundamentals") or {}
+    v      = result.get("valuation") or {}
+    sector = result.get("sector") or ""
+
+    tr  = s.get("trend")        or {}
+    mom = s.get("momentum")     or {}
+    vol = s.get("volume")       or {}
+    brk = s.get("breakout")     or {}
+    rs  = s.get("rel_strength") or {}
+
+    pts = 0
+    supports: list[tuple[str, str]] = []
+    objections: list[str] = []
+
+    # ── Structure: the breakout and the trend carry the setup ────────────────
+    if brk.get("score") == 1:
+        pts += 2
+    elif brk.get("score") == -1:
+        pts -= 2
+        objections.append(f"price is {abs(brk.get('pct_from_high', 0)):.0f}% below the 52-week "
+                          f"high, too deep for a base to have formed yet")
+
+    if tr.get("score") == 1:
+        pts += 1
+    elif tr.get("score") == -1:
+        pts -= 2
+        objections.append("price is under both the 50- and 200-day averages, which makes this a "
+                          "counter-trend bet")
+
+    if mom.get("score") == 1:
+        pts += 2 if mom.get("macd_crossed") else 1
+    elif mom.get("score") == -1:
+        rsi = mom.get("rsi")
+        pts -= 2
+        objections.append(f"RSI at {rsi} is outside the workable band" if _num(rsi)
+                          else "momentum has broken down")
+
+    diff = rs.get("rel_strength")
+    if rs.get("score") == 1 and _num(diff):
+        pts += 1
+        if diff >= 10:
+            pts += 1
+            supports.append(("rel_strength",
+                             f"{diff:+.1f}% relative strength over Nifty in a month — this is "
+                             f"already a leader, not a candidate"))
+        else:
+            supports.append(("rel_strength", f"{diff:+.1f}% ahead of Nifty over the past month"))
+    elif rs.get("score") == -1 and _num(diff):
+        pts -= 1
+        objections.append(f"it is lagging Nifty by {abs(diff):.1f}% over the month")
+
+    # Volume only means something against the setup it appears in: heavy volume
+    # confirms a breakout, but in a base it says the move has already been found.
+    ratio = vol.get("vol_ratio")
+    if _num(ratio):
+        if brk.get("forming_base") and ratio < 1.0:
+            pts += 1
+            supports.append(("volume",
+                             f"the base is tightening on {ratio}x volume — quiet accumulation, "
+                             f"the version of this setup that has not been front-run"))
+        elif ratio >= 1.5:
+            pts += 1
+            supports.append(("volume", f"{ratio}x the 20-day average volume behind the move"))
+        elif ratio < 0.7:
+            objections.append(f"volume at {ratio}x average is thin — nobody is voting on this yet")
+
+    # ── Business: does the company back what the chart is doing? ─────────────
+    eg = f.get("earnings_growth")
+    if _num(eg):
+        if eg >= 20:
+            pts += 1
+            supports.append(("earnings", f"earnings compounding {eg:+.1f}% YoY"))
+        elif eg < 0:
+            pts -= 1
+            objections.append(f"earnings are contracting {eg:+.1f}% YoY — the chart is ahead of "
+                              f"the business")
+
+    roe = f.get("roe")
+    if _num(roe) and roe >= 18:
+        pts += 1
+        supports.append(("roe", f"{roe:.1f}% return on equity"))
+
+    pe, pe_fwd = f.get("pe"), f.get("pe_fwd")
+    if _num(pe) and _num(pe_fwd) and pe_fwd < pe:
+        pts += 1
+        supports.append(("pe", f"forward PE of {pe_fwd}x against {pe}x trailing — the multiple "
+                               f"de-rates as earnings land"))
+
+    dte = f.get("debt_to_equity")
+    if _num(dte) and dte > 150 and sector not in _FINANCIAL_SECTORS:
+        pts -= 1
+        objections.append(f"debt/equity of {dte:.0f} is heavy for a non-lender")
+
+    gap = v.get("pe_vs_peer_pct")
+    if _num(gap) and v.get("peer_n"):
+        if gap <= -15 and not v.get("parity_caveat"):
+            pts += 1
+            supports.append(("peer", f"{abs(gap):.0f}% cheaper than the {sector} peer median on "
+                                     f"PE (n={v['peer_n']})"))
+        elif gap >= 40:
+            objections.append(f"it is {gap:.0f}% more expensive than sector peers — the quality "
+                              f"is already in the price")
+
+    pat_cagr = v.get("pat_cagr_pct")
+    if _num(pat_cagr) and pat_cagr < 0:
+        pts -= 1
+        objections.append(f"multi-year PAT CAGR is negative at {pat_cagr:+.1f}%")
+
+    # ── News and payoff ──────────────────────────────────────────────────────
+    news = result.get("news_sentiment")
+    if news == 1:
+        pts += 1
+        articles = result.get("news") or []
+        head = articles[0].get("title") if articles and isinstance(articles[0], dict) else None
+        # Sentiment here is a keyword match over headlines, not a read of the news, so
+        # the headline is quoted for the reader to judge rather than asserted as a catalyst.
+        supports.append(("news", f'headlines reading positive in the last five days, led by '
+                                 f'"{head}"' if head
+                                 else "positive news flow in the last five days"))
+    elif news == -1:
+        pts -= 2
+        objections.append("negative news flow in the last five days — the tape may know something "
+                          "the chart has not priced")
+
+    rr = result.get("rr_ratio")
+    if _num(rr):
+        if rr >= 2.5:
+            pts += 1
+            supports.append(("rr", f"{rr}:1 reward-to-risk"))
+        elif rr < 1.5:
+            pts -= 1
+            objections.append(f"only {rr}:1 reward-to-risk — thin payoff for the money at risk")
+
+    return pts, supports[:4], objections[:3]
+
+
+# Calibrated against the 48 picks on record, which score 4–11 without the news and
+# peer-valuation points that a live run also has. A screener that publishes only its
+# best candidates will happily call everything high conviction — which is the same
+# undifferentiated mush as having no tier at all — so the top band is set where only
+# a live pick carrying news and valuation support can reach it.
+def _conviction_tier(pts: int) -> str:
+    if pts >= 11:
+        return "High conviction"
+    if pts >= 9:
+        return "Constructive"
+    if pts >= 7:
+        return "Tactical — size it small"
+    return "Marginal — the weakest call this screen will publish"
+
+
+def _setup_line(result: dict, s: dict) -> tuple[str, str]:
+    """The lead: what this setup *is*, stated once and without hedging.
+
+    Returns the sentence and the beat it used, so the trigger does not re-tell it.
+    """
+    tr    = s.get("trend")    or {}
+    mom   = s.get("momentum") or {}
+    brk   = s.get("breakout") or {}
+    price = result.get("price")
+
+    high52, from_high = brk.get("52w_high"), brk.get("pct_from_high")
+
+    if brk.get("score") == 1 and _num(from_high) and from_high >= -5:
+        return (f"This is a breakout, not a bounce: ₹{price} sits {abs(from_high):.1f}% off the "
+                f"52-week high of ₹{high52}, with a full year of overhead supply already absorbed "
+                f"below it.", "breakout")
+    if brk.get("forming_base") and _num(from_high):
+        return (f"This is a coiled base: ₹{price} has held a range tighter than 8% while sitting "
+                f"{abs(from_high):.1f}% under the 52-week high of ₹{high52}. Buying the quiet "
+                f"stretch before the breakout is the whole premise of this screen.", "base")
+    if mom.get("macd_crossed"):
+        return (f"This is a momentum turn caught early: the MACD histogram flipped positive within "
+                f"the last five sessions with RSI at {mom.get('rsi')} — before the move is obvious "
+                f"on the chart.", "momentum")
+    if tr.get("score") == 1:
+        return (f"This is trend continuation: ₹{price} is holding above both the 50-day "
+                f"(₹{tr.get('sma50')}) and the 200-day (₹{tr.get('sma200')}) average.", "trend")
+    return (f"The chart is unremarkable at ₹{price} — this one is on the list for its numbers, "
+            f"not its setup.", "none")
+
+
+def _trigger_line(result: dict, s: dict, lead: str) -> tuple[str, str]:
+    """Why today and not last month. The freshest thing in the data leads, skipping
+    whatever the setup sentence has already said."""
+    mom = s.get("momentum")     or {}
+    vol = s.get("volume")       or {}
+    brk = s.get("breakout")     or {}
+    rs  = s.get("rel_strength") or {}
+
+    if mom.get("macd_crossed") and lead != "momentum":
+        return (f"The trigger is this week: MACD crossed up with RSI at {mom.get('rsi')}, the "
+                f"earliest confirmation this model will act on.", "momentum")
+
+    ratio, avg = vol.get("vol_ratio"), vol.get("avg_vol_20d")
+    if _num(ratio) and ratio >= 2 and _num(avg):
+        return (f"The trigger is today's tape: {ratio}x volume against a normal {avg:,.0f} shares "
+                f"a day — that is real money arriving, not drift.", "volume")
+
+    from_high = brk.get("pct_from_high")
+    if brk.get("forming_base") and _num(from_high) and lead != "base":
+        return (f"The trigger is the compression itself: the range has narrowed to within 8% while "
+                f"holding {abs(from_high):.1f}% off the high, and bases that tight resolve rather "
+                f"than persist.", "base")
+
+    diff = rs.get("rel_strength")
+    if _num(diff) and diff > 3:
+        stock, bench = rs.get("stock_1m_ret"), rs.get("nifty_1m_ret")
+        if _num(stock) and _num(bench):
+            return (f"The trigger is divergence: {stock:+.1f}% over the month against Nifty's "
+                    f"{bench:+.1f}% — money is rotating in while the index goes nowhere.",
+                    "rel_strength")
+    return "", "none"
+
+
+def _invalidation_line(result: dict) -> str:
+    """The falsifiable half of the call — the price that ends it."""
+    stop, target = result.get("stop_loss"), result.get("target")
+    if not _num(stop) or not _num(target):
+        return ""
+
+    stop_pct = result.get("stop_pct")
+    atr      = result.get("atr_14")
+    price    = result.get("price")
+
+    width = ""
+    if _num(atr) and atr > 0 and _num(price):
+        width = f", {(price - stop) / atr:.1f} ATR"
+    risk = f" ({stop_pct}% down{width})" if _num(stop_pct) else ""
+
+    bits = [f"The call is wrong below ₹{stop}{risk} — a close under that breaks the structure the "
+            f"whole thesis rests on, and the position goes with it."]
+
+    t1, target_pct, days = result.get("target_short"), result.get("target_pct"), result.get("target_days_est")
+    if _num(t1):
+        horizon = f" over an estimated {days} sessions" if _num(days) else ""
+        bits.append(f"₹{t1} is first confirmation, ₹{target}"
+                    f"{f' ({target_pct}%)' if _num(target_pct) else ''} the objective{horizon}.")
+    return " ".join(bits)
+
+
+# A trigger sentence already makes the case its own supporting clause would repeat.
+_TRIGGER_COVERS = {"volume": {"volume"}, "rel_strength": {"rel_strength"}}
+
+
 def generate_rationale(result: dict) -> str:
-    s = result["signals"]
-    parts = []
+    """The written call: setup, trigger, graded confidence, and what kills it."""
+    s = result.get("signals")
+    if not isinstance(s, dict) or not s:
+        return "No signal data — no call."
 
-    trend = s["trend"]
-    if trend["score"] == 1:
-        parts.append(f"Trading above both 50DMA (₹{trend.get('sma50','?')}) and 200DMA (₹{trend.get('sma200','?')}), confirming uptrend.")
-    elif trend["score"] == -1:
-        parts.append("Below key moving averages — trend is weak.")
+    pts, supports, objections = _conviction_evidence(result)
+    setup, lead   = _setup_line(result, s)
+    trigger, kind = _trigger_line(result, s, lead)
 
-    mom = s["momentum"]
-    if mom["score"] == 1:
-        if mom.get("macd_crossed"):
-            parts.append(f"RSI at {mom['rsi']} with MACD histogram just flipped positive — early momentum shift before confirmation.")
-        else:
-            parts.append(f"RSI at {mom['rsi']} — in the healthy momentum zone, not overbought.")
-    elif mom["score"] == -1:
-        parts.append(f"RSI at {mom['rsi']} — caution, momentum extended or broken.")
+    covered = _TRIGGER_COVERS.get(kind, set())
+    backing = [text for tag, text in supports if tag not in covered]
 
-    vol = s["volume"]
-    if vol["score"] == 1:
-        parts.append(f"Volume {vol.get('vol_ratio','?')}x the 20-day average — strong conviction in today's move.")
+    parts = [f"{_conviction_tier(pts)}. {setup}", trigger]
 
-    brk = s["breakout"]
-    if brk["score"] == 1:
-        if brk.get("forming_base"):
-            parts.append(f"Forming a tight base {abs(brk.get('pct_from_high', 0)):.1f}% below 52W high ₹{brk.get('52w_high','?')} — setting up for breakout.")
-        else:
-            parts.append(f"Price ₹{brk.get('price','?')} is within 5% of 52-week high ₹{brk.get('52w_high','?')} — breakout territory.")
+    if backing:
+        parts.append("Backing it: " + _join(backing) + ".")
+    if objections:
+        parts.append("Against it: " + _join(objections) + ".")
+    else:
+        parts.append("Nothing in the screened data argues against it — any objection has to come "
+                     "from outside what this model can see.")
 
-    rs = s["rel_strength"]
-    if rs["score"] == 1:
-        parts.append(f"Outperforming Nifty by {rs.get('rel_strength','?')}% over the last month.")
-    elif rs["score"] == -1:
-        parts.append(f"Underperforming Nifty by {abs(rs.get('rel_strength',0))}% — relative weakness.")
-
-    news_score = result.get("news_sentiment", 0)
-    if news_score == 1:
-        parts.append("Positive news sentiment in the last 5 days.")
-    elif news_score == -1:
-        parts.append("Caution: negative news sentiment detected in the last 5 days.")
-
-    return " ".join(parts) if parts else "Mixed signals — monitor closely."
+    parts.append(_invalidation_line(result))
+    return " ".join(p for p in parts if p)
 
 def generate_fundamentals_summary(f: dict) -> str:
     if not f:
