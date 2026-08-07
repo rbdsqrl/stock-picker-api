@@ -29,12 +29,21 @@ app.add_middleware(
 scheduler = BackgroundScheduler()
 
 # ── Screening state ───────────────────────────────────────────────────────────
+# There is one screening run for the whole service, not one per user: the screen is
+# identical for everybody and each run costs ~500 upstream fetches. Callers that ask
+# for a run while one is in flight attach to it instead of starting another.
 _state_lock = threading.Lock()
 _state = {
-    "status": "idle",   # idle | running | done | stopped | error
-    "logs":   [],
-    "abort":  threading.Event(),
+    "status":     "idle",   # idle | running | done | stopped | error
+    "logs":       [],
+    "abort":      threading.Event(),
+    "started_at": None,
 }
+
+# Held for the duration of a run. Guarding on the status string alone is racy — two
+# requests can both read "idle" before either task starts — so admission is decided
+# by whoever takes this lock.
+_run_guard = threading.Lock()
 
 def _emit(msg: str):
     ts = datetime.now().strftime("%H:%M:%S")
@@ -58,12 +67,23 @@ def shutdown():
     scheduler.shutdown()
 
 def run_and_save():
-    with _state_lock:
-        if _state["status"] == "running":
-            return
-        _state["status"] = "running"
-        _state["logs"] = []
-        _state["abort"].clear()
+    # Non-blocking: if a run is already in flight this call is a no-op, and whoever
+    # asked for it is expected to follow the live run via /api/screen/status.
+    if not _run_guard.acquire(blocking=False):
+        log.info("run_and_save: a screening run is already in flight — not starting another")
+        return
+    try:
+        with _state_lock:
+            _state["status"]     = "running"
+            _state["logs"]       = []
+            _state["started_at"] = datetime.now().isoformat()
+            _state["abort"].clear()
+        _run_screening_body()
+    finally:
+        _run_guard.release()
+
+
+def _run_screening_body():
     try:
         ready_picks = run_screening_combined(log_cb=_emit, abort_event=_state["abort"])
         for pick in ready_picks:
@@ -157,9 +177,20 @@ async def recalculate_levels():
 
 @app.post("/api/screen/run")
 def manual_run(background_tasks: BackgroundTasks):
+    """Start a screening run, or hand back the one already in progress.
+
+    The screen is the same for every user, so a second request while one is running
+    attaches the caller to it rather than queueing another ~500-fetch pass upstream.
+    The logs so far come back with the response so the client can render the live run
+    immediately instead of waiting for its first status poll.
+    """
     with _state_lock:
         if _state["status"] == "running":
-            return {"status": "already_running"}
+            return {
+                "status":     "already_running",
+                "logs":       list(_state["logs"]),
+                "started_at": _state["started_at"],
+            }
     background_tasks.add_task(run_and_save)
     return {"status": "started"}
 
@@ -167,8 +198,9 @@ def manual_run(background_tasks: BackgroundTasks):
 def screen_status():
     with _state_lock:
         return {
-            "status": _state["status"],
-            "logs":   list(_state["logs"]),
+            "status":     _state["status"],
+            "logs":       list(_state["logs"]),
+            "started_at": _state["started_at"],
         }
 
 @app.post("/api/screen/stop")
