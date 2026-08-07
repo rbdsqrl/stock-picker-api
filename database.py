@@ -1,6 +1,6 @@
 import psycopg2
 import psycopg2.extras
-from datetime import date as date_type, timedelta
+from datetime import date as date_type, datetime, timedelta
 import json
 import os
 import logging
@@ -8,6 +8,10 @@ import logging
 log = logging.getLogger(__name__)
 
 _DATABASE_URL = os.environ.get("DATABASE_URL", "")
+
+
+def _now_iso() -> str:
+    return datetime.now().isoformat()
 
 
 def get_conn():
@@ -73,42 +77,13 @@ def init_db():
                 fundamental_floor_pct REAL,
                 outcome_price   REAL,
                 outcome_pct     REAL,
-                created_at      TIMESTAMPTZ DEFAULT NOW(),
-                UNIQUE(date, rank)
+                run_at          TEXT,
+                screened_count  INTEGER,
+                created_at      TIMESTAMPTZ DEFAULT NOW()
             )
         """)
-
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS watchlist_picks (
-                id                SERIAL PRIMARY KEY,
-                date              TEXT    NOT NULL,
-                rank              INTEGER NOT NULL DEFAULT 1,
-                ticker            TEXT    NOT NULL,
-                company           TEXT,
-                sector            TEXT,
-                price_at_pick     REAL,
-                early_score       REAL,
-                pct_from_52w_high REAL,
-                setup_summary     TEXT,
-                watch_for         TEXT,
-                signals           TEXT,
-                fundamentals      TEXT,
-                stop_loss         REAL,
-                stop_pct          REAL,
-                target            REAL,
-                target_pct        REAL,
-                entry_breakout    REAL,
-                atr_14            REAL,
-                rr_ratio          REAL,
-                target_days_est   INTEGER,
-                screened_count    INTEGER,
-                run_at            TEXT,
-                news              TEXT,
-                news_sentiment    INTEGER,
-                created_at        TIMESTAMPTZ DEFAULT NOW(),
-                UNIQUE(date, rank)
-            )
-        """)
+        # Uniqueness is added below rather than inline, so that a fresh table and a
+        # migrated one end up with exactly one constraint under the same name.
 
         # Additive column migrations — safe to re-run (IF NOT EXISTS)
         for col, typedef in [
@@ -134,16 +109,30 @@ def init_db():
             ("target_short_hit_date", "TEXT"),
             ("target_short_hit_days", "INTEGER"),
             ("valuation",             "TEXT"),
+            ("run_at",                "TEXT"),
+            ("screened_count",        "INTEGER"),
         ]:
             cur.execute(f"ALTER TABLE picks ADD COLUMN IF NOT EXISTS {col} {typedef}")
 
-        for col, typedef in [
-            ("news",             "TEXT"),
-            ("news_sentiment",   "INTEGER"),
-            ("target_short",     "REAL"),
-            ("target_short_pct", "REAL"),
-        ]:
-            cur.execute(f"ALTER TABLE watchlist_picks ADD COLUMN IF NOT EXISTS {col} {typedef}")
+        # ── Multi-run migration ──────────────────────────────────────────────
+        # Picks used to be unique on (date, rank), so a second screen on the same
+        # day overwrote the first and the earlier calls were lost. Uniqueness now
+        # includes run_at, which keeps every run on the record. Rows written before
+        # this get their created_at as a synthetic run stamp so they stay unique
+        # among themselves — NULL run_at would make every historical row collide.
+        cur.execute("UPDATE picks SET run_at = COALESCE(created_at::text, date) WHERE run_at IS NULL")
+        cur.execute("ALTER TABLE picks DROP CONSTRAINT IF EXISTS picks_date_rank_key")
+        cur.execute("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint WHERE conname = 'picks_date_run_rank_key'
+                ) THEN
+                    ALTER TABLE picks ADD CONSTRAINT picks_date_run_rank_key
+                        UNIQUE (date, run_at, rank);
+                END IF;
+            END $$;
+        """)
 
         conn.commit()
     finally:
@@ -151,8 +140,14 @@ def init_db():
 
 
 def save_pick(pick: dict, rank: int = 1):
+    """Insert one pick. Every screening run is kept — a re-run on the same day adds
+    a new set of rows under its own run_at rather than overwriting the earlier call."""
     conn = get_conn()
     today = date_type.today().isoformat()
+    # Runs are identified by the timestamp the screen started, which run_screening_*
+    # stamps onto every pick in the batch. Falling back to now() would give each row
+    # in a batch its own run, so a missing stamp is worth being explicit about.
+    run_at = pick.get("run_at") or _now_iso()
     try:
         cur = _cur(conn)
         cur.execute("""
@@ -161,9 +156,9 @@ def save_pick(pick: dict, rank: int = 1):
              score, signals, rationale, news, fundamentals,
              stop_loss, stop_pct, target, target_pct, target_short, target_short_pct,
              entry_breakout, atr_14, rr_ratio, target_days_est,
-             fundamental_floor_pct, valuation)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            ON CONFLICT (date, rank) DO UPDATE SET
+             fundamental_floor_pct, valuation, run_at, screened_count)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (date, run_at, rank) DO UPDATE SET
                 ticker                = EXCLUDED.ticker,
                 company               = EXCLUDED.company,
                 sector                = EXCLUDED.sector,
@@ -184,7 +179,8 @@ def save_pick(pick: dict, rank: int = 1):
                 rr_ratio              = EXCLUDED.rr_ratio,
                 target_days_est       = EXCLUDED.target_days_est,
                 fundamental_floor_pct = EXCLUDED.fundamental_floor_pct,
-                valuation             = EXCLUDED.valuation
+                valuation             = EXCLUDED.valuation,
+                screened_count        = EXCLUDED.screened_count
         """, (
             today, rank,
             pick["ticker"],
@@ -208,6 +204,8 @@ def save_pick(pick: dict, rank: int = 1):
             pick.get("target_days_est"),
             pick.get("fundamental_floor_pct"),
             json.dumps(pick.get("valuation", {})),
+            run_at,
+            pick.get("screened_count"),
         ))
         conn.commit()
     finally:
@@ -215,17 +213,27 @@ def save_pick(pick: dict, rank: int = 1):
 
 
 def get_today_picks() -> list[dict]:
+    """The most recent run for today. Every run is kept, but the Today view shows
+    the current call — earlier runs from the same day live on in history."""
     conn = get_conn()
     today = date_type.today().isoformat()
     try:
         cur = _cur(conn)
-        cur.execute("SELECT * FROM picks WHERE date = %s ORDER BY rank", (today,))
+        cur.execute("""
+            SELECT * FROM picks
+            WHERE date = %s
+              AND run_at IS NOT DISTINCT FROM (
+                  SELECT MAX(run_at) FROM picks WHERE date = %s
+              )
+            ORDER BY rank
+        """, (today, today))
         return [_row_to_dict(r) for r in cur.fetchall()]
     finally:
         conn.close()
 
 
 def get_history(limit=30) -> list[dict]:
+    """Every pick from the last `limit` days, including all runs on the same day."""
     conn = get_conn()
     try:
         cur = _cur(conn)
@@ -234,7 +242,7 @@ def get_history(limit=30) -> list[dict]:
             WHERE date IN (
                 SELECT DISTINCT date FROM picks ORDER BY date DESC LIMIT %s
             )
-            ORDER BY date DESC, rank ASC
+            ORDER BY date DESC, run_at DESC, rank ASC
         """, (limit,))
         return [_row_to_dict(r) for r in cur.fetchall()]
     finally:
@@ -521,129 +529,23 @@ def get_recently_picked_tickers(days: int = 3) -> set:
         conn.close()
 
 
-def save_watchlist_picks(picks: list[dict]):
-    if not picks:
-        return
-    conn = get_conn()
-    today = date_type.today().isoformat()
-    try:
-        cur = _cur(conn)
-        for pick in picks:
-            cur.execute("""
-                INSERT INTO watchlist_picks
-                (date, rank, ticker, company, sector, price_at_pick,
-                 early_score, pct_from_52w_high, setup_summary, watch_for,
-                 signals, fundamentals,
-                 stop_loss, stop_pct, target, target_pct,
-                 entry_breakout, atr_14, rr_ratio, target_days_est,
-                 screened_count, run_at, news, news_sentiment)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                ON CONFLICT (date, rank) DO UPDATE SET
-                    ticker            = EXCLUDED.ticker,
-                    company           = EXCLUDED.company,
-                    sector            = EXCLUDED.sector,
-                    price_at_pick     = EXCLUDED.price_at_pick,
-                    early_score       = EXCLUDED.early_score,
-                    pct_from_52w_high = EXCLUDED.pct_from_52w_high,
-                    setup_summary     = EXCLUDED.setup_summary,
-                    watch_for         = EXCLUDED.watch_for,
-                    signals           = EXCLUDED.signals,
-                    fundamentals      = EXCLUDED.fundamentals,
-                    stop_loss         = EXCLUDED.stop_loss,
-                    stop_pct          = EXCLUDED.stop_pct,
-                    target            = EXCLUDED.target,
-                    target_pct        = EXCLUDED.target_pct,
-                    entry_breakout    = EXCLUDED.entry_breakout,
-                    atr_14            = EXCLUDED.atr_14,
-                    rr_ratio          = EXCLUDED.rr_ratio,
-                    target_days_est   = EXCLUDED.target_days_est,
-                    screened_count    = EXCLUDED.screened_count,
-                    run_at            = EXCLUDED.run_at,
-                    news              = EXCLUDED.news,
-                    news_sentiment    = EXCLUDED.news_sentiment
-            """, (
-                today, pick.get("rank", 1),
-                pick["ticker"],
-                pick.get("company", ""),
-                pick.get("sector", ""),
-                pick.get("price"),
-                pick.get("early_score"),
-                pick.get("pct_from_52w_high"),
-                pick.get("setup_summary", ""),
-                pick.get("watch_for", ""),
-                json.dumps(pick.get("signals", {})),
-                json.dumps(pick.get("fundamentals", {})),
-                pick.get("stop_loss"),
-                pick.get("stop_pct"),
-                pick.get("target"),
-                pick.get("target_pct"),
-                pick.get("entry_breakout"),
-                pick.get("atr_14"),
-                pick.get("rr_ratio"),
-                pick.get("target_days_est"),
-                pick.get("screened_count"),
-                pick.get("run_at"),
-                json.dumps(pick.get("news", [])),
-                pick.get("news_sentiment", 0),
-            ))
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def get_watchlist_history(limit=30) -> list[dict]:
-    conn = get_conn()
-    try:
-        cur = _cur(conn)
-        cur.execute("""
-            SELECT * FROM watchlist_picks
-            WHERE date IN (
-                SELECT DISTINCT date FROM watchlist_picks ORDER BY date DESC LIMIT %s
-            )
-            ORDER BY date DESC, rank ASC
-        """, (limit,))
-        return [_watchlist_row_to_dict(r) for r in cur.fetchall()]
-    finally:
-        conn.close()
-
-
-def get_today_watchlist() -> list[dict]:
-    conn = get_conn()
-    today = date_type.today().isoformat()
-    try:
-        cur = _cur(conn)
-        cur.execute("SELECT * FROM watchlist_picks WHERE date = %s ORDER BY rank", (today,))
-        return [_watchlist_row_to_dict(r) for r in cur.fetchall()]
-    finally:
-        conn.close()
-
-
-def _watchlist_row_to_dict(row):
-    d = dict(row)
-    for field in ("signals", "fundamentals", "news"):
-        if d.get(field):
-            try:
-                d[field] = json.loads(d[field])
-            except Exception:
-                pass
-    d["price"]     = d.get("price_at_pick")
-    d["entry_cmp"] = d.get("price_at_pick")
-    return d
-
-
 def update_outcome(pick_date: str, outcome_price: float):
+    # A date can hold several runs, so this targets the #1 pick of the LAST run that
+    # day rather than every rank-1 row on the date.
     conn = get_conn()
     try:
         cur = _cur(conn)
         cur.execute(
-            "SELECT price_at_pick FROM picks WHERE date = %s AND rank = 1", (pick_date,)
+            "SELECT id, price_at_pick FROM picks WHERE date = %s AND rank = 1 "
+            "ORDER BY run_at DESC NULLS LAST LIMIT 1",
+            (pick_date,),
         )
         row = cur.fetchone()
         if row and row["price_at_pick"]:
             pct = ((outcome_price - row["price_at_pick"]) / row["price_at_pick"]) * 100
             cur.execute(
-                "UPDATE picks SET outcome_price = %s, outcome_pct = %s WHERE date = %s AND rank = 1",
-                (outcome_price, round(pct, 2), pick_date),
+                "UPDATE picks SET outcome_price = %s, outcome_pct = %s WHERE id = %s",
+                (outcome_price, round(pct, 2), row["id"]),
             )
             conn.commit()
     finally:

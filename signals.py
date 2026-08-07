@@ -136,7 +136,6 @@ SIGNAL_WEIGHTS = {
     "rel_strength": 0.15,
 }
 NEWS_WEIGHT = 0.10           # Applied post-hoc to top 10 ready candidates
-WATCHLIST_NEWS_WEIGHT = 0.10 # Applied post-hoc to top watchlist candidates
 
 # ── Risk / target policy ─────────────────────────────────────────────────────
 # The stop is sized in ATR units, not percent. A flat 5% cap used to put the
@@ -156,16 +155,6 @@ MIN_TARGET_PCT = 12.0   # floor on the long target; also the screener's gate
 # and you get a read on the thesis long before T2 resolves.
 TARGET_SHORT_R = 1.0    # short-term target, in multiples of risk
 TARGET_LONG_R  = 2.0    # long-term target, in multiples of risk
-
-# Weights for the early / leading-indicator watchlist tier
-EARLY_SIGNAL_WEIGHTS = {
-    "higher_lows":      0.25,  # ascending support toward 52W high — strongest breakout predictor
-    "macd_crossover":   0.20,
-    "rsi_recovery":     0.20,
-    "obv_accumulation": 0.15,
-    "bb_squeeze":       0.10,
-    "rel_strength":     0.10,
-}
 
 # ── News sentiment ────────────────────────────────────────────────────────────
 
@@ -267,16 +256,6 @@ def _macd(close: pd.Series, fast=12, slow=26, signal=9):
     macd_line = ema_fast - ema_slow
     signal_line = macd_line.ewm(span=signal, adjust=False).mean()
     return macd_line, signal_line, macd_line - signal_line
-
-def _obv(close: pd.Series, volume: pd.Series) -> pd.Series:
-    direction = np.sign(close.diff().fillna(0))
-    return (volume * direction).cumsum()
-
-def _bb_width(close: pd.Series, period=20) -> pd.Series:
-    """Normalised Bollinger Band width = 4σ / SMA."""
-    sma = close.rolling(period).mean()
-    std = close.rolling(period).std()
-    return (4 * std) / sma.replace(0, np.nan)
 
 def compute_trade_levels(close: pd.Series, high: pd.Series, low: pd.Series,
                          entry_price: float | None = None) -> dict:
@@ -438,137 +417,6 @@ def signal_rel_strength(ticker_close: pd.Series, bench_close: pd.Series) -> tupl
     else:
         score = 0
     return score, {"stock_1m_ret": round(stock_ret, 1), "nifty_1m_ret": round(bench_ret, 1), "rel_strength": round(diff, 1)}
-
-# ── Early / leading-indicator signals ────────────────────────────────────────
-
-def signal_macd_crossover(close: pd.Series) -> tuple[int, dict]:
-    """MACD histogram crossed from negative to positive in last 5 bars = early momentum shift."""
-    if len(close) < 35:
-        return 0, {}
-    _, _, hist = _macd(close)
-    today        = float(hist.iloc[-1])
-    prev5        = hist.iloc[-6:-1]
-    just_crossed = bool(any(prev5 < 0) and today > 0)
-    sustained    = bool(today > 0 and float(hist.iloc[-2]) > 0 and float(hist.iloc[-3]) > 0)
-    hist_pct     = today / float(close.iloc[-1]) * 100   # normalise by price
-
-    if just_crossed or sustained:
-        score = 1
-    elif hist_pct < -0.3:
-        score = -1
-    else:
-        score = 0
-    return score, {"hist_pct": round(hist_pct, 3), "just_crossed": just_crossed}
-
-
-def signal_rsi_recovery(close: pd.Series) -> tuple[int, dict]:
-    """RSI was below 45 in the last 10 bars, now above 40 and rising = catching the turn."""
-    if len(close) < 30:
-        return 0, {}
-    delta = close.diff()
-    gain  = delta.clip(lower=0).rolling(14).mean()
-    loss  = (-delta.clip(upper=0)).rolling(14).mean()
-    rsi_s = (100 - 100 / (1 + gain / loss.replace(0, np.nan))).dropna()
-    if len(rsi_s) < 15:
-        return 0, {}
-    current  = float(rsi_s.iloc[-1])
-    low_10d  = float(rsi_s.iloc[-11:-1].min())
-    slope_3d = float(rsi_s.iloc[-1]) - float(rsi_s.iloc[-4])
-
-    if low_10d < 45 and current > 40 and slope_3d > 0:
-        score = 1    # recovering from weakness — catching the turn
-    elif current > 60:
-        score = -1   # already running — not an early entry
-    elif current < 28:
-        score = -1   # deeply broken
-    else:
-        score = 0
-    return score, {"rsi": round(current, 1), "rsi_10d_low": round(low_10d, 1)}
-
-
-def signal_obv_accumulation(close: pd.Series, volume: pd.Series) -> tuple[int, dict]:
-    """OBV trending up while price is flat or down = smart-money accumulation before price moves."""
-    if len(close) < 25:
-        return 0, {}
-    obv       = _obv(close, volume)
-    price_chg = (float(close.iloc[-1]) / float(close.iloc[-20]) - 1) * 100
-    base_obv  = float(obv.iloc[-20])
-    if base_obv == 0:
-        return 0, {}
-    obv_chg = (float(obv.iloc[-1]) - base_obv) / abs(base_obv) * 100
-
-    if obv_chg > 5 and price_chg < 3:
-        score = 1    # OBV leading price up
-    elif obv_chg > 15:
-        score = 1    # strong OBV momentum regardless
-    elif obv_chg < -10:
-        score = -1   # distribution
-    else:
-        score = 0
-    return score, {"obv_chg_pct": round(obv_chg, 1), "price_chg_pct": round(price_chg, 1)}
-
-
-def signal_bb_squeeze(close: pd.Series) -> tuple[int, dict]:
-    """Bollinger Band width in bottom 25th percentile of last 60 days = volatility coiling before a move."""
-    if len(close) < 65:
-        return 0, {}
-    bw       = _bb_width(close)
-    current  = float(bw.iloc[-1])
-    hist_60  = bw.iloc[-60:]
-    pct_rank = float((hist_60 < current).mean()) * 100   # 0 = tightest, 100 = widest
-
-    if pct_rank <= 25:
-        score = 1    # coiled spring
-    elif pct_rank >= 75:
-        score = -1   # already expanded
-    else:
-        score = 0
-    return score, {"bb_pct_rank": round(pct_rank, 0)}
-
-
-def signal_higher_lows(close: pd.Series, high: pd.Series) -> tuple[int, dict]:
-    """
-    Ascending support lines (higher lows over 20 days) while approaching 52W high.
-    This is the clearest price action confirmation that a stock is genuinely coiling
-    for a breakout — each pullback holds at a higher level, compressing toward resistance.
-    Only evaluated for stocks within 15% of their 52W high.
-    """
-    if len(close) < 20:
-        return 0, {}
-
-    price    = float(close.iloc[-1])
-    high_52w = float(high.iloc[-252:].max()) if len(high) >= 252 else float(high.max())
-    pct_from_high = (price - high_52w) / high_52w * 100
-
-    if pct_from_high < -15:   # outside the breakout setup zone
-        return 0, {}
-
-    # Split last 20 bars into three segments; compare their minima
-    recent   = close.iloc[-20:]
-    seg1_low = float(recent.iloc[:7].min())    # oldest 7 bars
-    seg2_low = float(recent.iloc[7:14].min())  # middle 7 bars
-    seg3_low = float(recent.iloc[14:].min())   # newest 6 bars
-
-    higher_lows = seg2_low > seg1_low and seg3_low > seg2_low
-
-    range_20d  = (float(recent.max()) - float(recent.min())) / price * 100
-    tight_base = range_20d < 8.0   # volatility contracting near resistance
-
-    if higher_lows and tight_base:
-        score = 1   # ascending support + volatility squeeze = breakout imminent
-    elif higher_lows and pct_from_high > -8:
-        score = 1   # higher lows within 8% of 52W high = strong setup
-    elif not higher_lows and pct_from_high < -10:
-        score = -1  # lower lows and still far from high = not setting up
-    else:
-        score = 0
-
-    return score, {
-        "higher_lows":   higher_lows,
-        "tight_base":    tight_base,
-        "range_20d_pct": round(range_20d, 1),
-    }
-
 
 # ── Liquidity filter ──────────────────────────────────────────────────────────
 
@@ -1367,26 +1215,25 @@ def generate_fundamentals_summary(f: dict) -> str:
 
     return " ".join(parts[:3]) if parts else "Limited fundamental data available."
 
-# ── Combined single-stock screen (ready + early, one yfinance fetch) ─────────
+# ── Single-stock screen (one yfinance fetch) ─────────────────────────────────
 
-def screen_stock_combined(ticker: str, bench_close: pd.Series, _retry: bool = True) -> tuple[dict | None, dict | None]:
+def screen_stock_combined(ticker: str, bench_close: pd.Series, _retry: bool = True) -> dict | None:
     """
-    Single yfinance fetch. Evaluates both the main (confirmatory) signals and the early
-    (leading) signals. Returns (main_result, early_result); at most one will be non-None.
-    Stocks that meet the main 'ready' criteria skip early evaluation.
+    Single yfinance fetch. Evaluates the confirmatory signals and returns the pick,
+    or None if the stock does not qualify.
     """
     try:
         info_obj = yf.Ticker(ticker)
         df = info_obj.history(period="1y", actions=False)
         if df.empty or len(df) < 50:
-            return None, None
+            return None
 
         df = df.reset_index(drop=True)
         for col in ("Close", "High", "Low", "Volume"):
             df[col] = pd.to_numeric(df[col], errors="coerce")
         df = df.dropna(subset=["Close", "High", "Low", "Volume"])
         if len(df) < 50:
-            return None, None
+            return None
 
         close  = df["Close"]
         high   = df["High"]
@@ -1394,7 +1241,7 @@ def screen_stock_combined(ticker: str, bench_close: pd.Series, _retry: bool = Tr
         volume = df["Volume"]
 
         if not passes_liquidity(volume, close):
-            return None, None
+            return None
 
         price    = float(close.iloc[-1])
         high_52w = float(high.iloc[-252:].max()) if len(high) >= 252 else float(high.max())
@@ -1405,7 +1252,7 @@ def screen_stock_combined(ticker: str, bench_close: pd.Series, _retry: bool = Tr
         # ≥ 0  → already broken out and running; skip.
         # < -25 → too far from the setup zone; skip.
         if pct_from_high >= 0 or pct_from_high < -25:
-            return None, None
+            return None
 
         # ── Shared fundamentals & trade levels ──────────────────────────────
         info    = info_obj.info
@@ -1460,91 +1307,33 @@ def screen_stock_combined(ticker: str, bench_close: pd.Series, _retry: bool = Tr
         s_rs,     d_rs     = signal_rel_strength(close, bench_close)
 
         # Not-yet-moving filters: discard stocks whose momentum is already elevated
-        # or where a volume breakout has already started.
+        # or where a volume breakout has already started. The point of the screen is
+        # to be early, so a stock that has already run is not a candidate.
         rsi_val   = d_mom.get("rsi", 50) or 50
         vol_ratio = d_vol.get("vol_ratio", 1.0) or 1.0
         if rsi_val > 60 or vol_ratio > 1.5:
-            # Still evaluate for the early/watchlist tier below
-            pass
-        else:
-            main_score = (
-                s_trend  * SIGNAL_WEIGHTS["trend"]        +
-                s_mom    * SIGNAL_WEIGHTS["momentum"]     +
-                s_vol    * SIGNAL_WEIGHTS["volume"]       +
-                s_break  * SIGNAL_WEIGHTS["breakout"]     +
-                s_rs     * SIGNAL_WEIGHTS["rel_strength"]
-            )
+            return None
 
-            if main_score > 0 and trade.get("target_pct", 0) >= MIN_TARGET_PCT:
-                return {
-                    **base,
-                    "score": round(main_score, 4),
-                    "signals": {
-                        "trend":        {"score": s_trend,  **d_trend},
-                        "momentum":     {"score": s_mom,    **d_mom},
-                        "volume":       {"score": s_vol,    **d_vol},
-                        "breakout":     {"score": s_break,  **d_break},
-                        "rel_strength": {"score": s_rs,     **d_rs},
-                    },
-                }, None
-
-        # ── Early (leading) signals — zone already guaranteed by outer gate ──
-        # Outer gate ensures -25% ≤ pct_from_high < 0, so all remaining stocks
-        # are genuinely approaching their 52W high.
-
-        s_hl,   d_hl   = signal_higher_lows(close, high)
-        s_macd, d_macd = signal_macd_crossover(close)
-        s_rsi,  d_rsi  = signal_rsi_recovery(close)
-        s_obv,  d_obv  = signal_obv_accumulation(close, volume)
-        s_bb,   d_bb   = signal_bb_squeeze(close)
-
-        early_score = (
-            s_hl   * EARLY_SIGNAL_WEIGHTS["higher_lows"]      +
-            s_macd * EARLY_SIGNAL_WEIGHTS["macd_crossover"]   +
-            s_rsi  * EARLY_SIGNAL_WEIGHTS["rsi_recovery"]     +
-            s_obv  * EARLY_SIGNAL_WEIGHTS["obv_accumulation"] +
-            s_bb   * EARLY_SIGNAL_WEIGHTS["bb_squeeze"]       +
-            s_rs   * EARLY_SIGNAL_WEIGHTS["rel_strength"]
+        main_score = (
+            s_trend  * SIGNAL_WEIGHTS["trend"]        +
+            s_mom    * SIGNAL_WEIGHTS["momentum"]     +
+            s_vol    * SIGNAL_WEIGHTS["volume"]       +
+            s_break  * SIGNAL_WEIGHTS["breakout"]     +
+            s_rs     * SIGNAL_WEIGHTS["rel_strength"]
         )
 
-        if early_score <= 0:
-            return None, None
+        if main_score <= 0 or trade.get("target_pct", 0) < MIN_TARGET_PCT:
+            return None
 
-        triggers = []
-        if s_hl == 1:
-            label = "Higher lows · Tight base" if d_hl.get("tight_base") else "Higher lows"
-            triggers.append(label)
-        if d_macd.get("just_crossed"): triggers.append("MACD crossed")
-        elif s_macd == 1:              triggers.append("MACD positive")
-        if s_rsi == 1:                 triggers.append("RSI recovering")
-        if s_obv == 1:                 triggers.append("OBV accumulation")
-        if s_bb  == 1:                 triggers.append("BB squeeze")
-        setup_summary = " · ".join(triggers) if triggers else "Early signals"
-
-        rsi_now = d_rsi.get("rsi", 50.0)
-        watch_parts = []
-        if rsi_now < 40:
-            watch_parts.append(f"RSI > 45 (now {rsi_now:.0f})")
-        if pct_from_high < -8:
-            watch_parts.append(f"Price within 5% of 52W high ₹{round(high_52w, 0):.0f}")
-        if s_hl == 1 and d_hl.get("tight_base"):
-            watch_parts.append("Volume breakout above base")
-        if not watch_parts:
-            watch_parts.append("Confirm with volume breakout")
-
-        return None, {
+        return {
             **base,
-            "early_score":       round(early_score, 4),
-            "pct_from_52w_high": round(pct_from_high, 1),
-            "setup_summary":     setup_summary,
-            "watch_for":         " · ".join(watch_parts),
+            "score": round(main_score, 4),
             "signals": {
-                "higher_lows":      {"score": s_hl,   **d_hl},
-                "macd_crossover":   {"score": s_macd, **d_macd},
-                "rsi_recovery":     {"score": s_rsi,  **d_rsi},
-                "obv_accumulation": {"score": s_obv,  **d_obv},
-                "bb_squeeze":       {"score": s_bb,   **d_bb},
-                "rel_strength":     {"score": s_rs,   **d_rs},
+                "trend":        {"score": s_trend,  **d_trend},
+                "momentum":     {"score": s_mom,    **d_mom},
+                "volume":       {"score": s_vol,    **d_vol},
+                "breakout":     {"score": s_break,  **d_break},
+                "rel_strength": {"score": s_rs,     **d_rs},
             },
         }
 
@@ -1554,8 +1343,8 @@ def screen_stock_combined(ticker: str, bench_close: pd.Series, _retry: bool = Tr
             log.warning(f"{ticker}: rate limited — waiting 15s before retry")
             time.sleep(15)
             return screen_stock_combined(ticker, bench_close, _retry=False)
-        log.error(f"{ticker}: combined screen error — {e}")
-        return None, None
+        log.error(f"{ticker}: screen error — {e}")
+        return None
 
 
 # ── Single-stock deep analysis ────────────────────────────────────────────────
@@ -1803,19 +1592,17 @@ def run_screening(log_cb=None, abort_event=None) -> list[dict]:
     return top3
 
 
-def run_screening_combined(log_cb=None, abort_event=None) -> tuple[list[dict], list[dict]]:
+def run_screening_combined(log_cb=None, abort_event=None) -> list[dict]:
     """
     Single-pass screening over Nifty 500. One yfinance fetch per stock.
-    Returns (ready_picks [top 3], watchlist_picks [top 5]).
-    ready_picks  — confirmatory signals met; trade now.
-    watchlist_picks — leading indicators firing; wait for trigger before entering.
+    Returns the top 5 picks — confirmatory signals met, trade now.
     """
     def emit(msg):
         log.info(msg)
         if log_cb:
             log_cb(msg)
 
-    emit("=== Starting combined screening (Ready + Setting Up) ===")
+    emit("=== Starting screening ===")
     emit("Loading Nifty 500 universe...")
     watchlist = get_watchlist()
     emit(f"Universe: {len(watchlist)} stocks")
@@ -1828,7 +1615,6 @@ def run_screening_combined(log_cb=None, abort_event=None) -> tuple[list[dict], l
 
     total = len(watchlist)
     ready_candidates = []
-    early_candidates = []
 
     for i, ticker in enumerate(watchlist):
         if abort_event and abort_event.is_set():
@@ -1836,28 +1622,24 @@ def run_screening_combined(log_cb=None, abort_event=None) -> tuple[list[dict], l
             break
 
         emit(f"[{i+1}/{total}] {ticker}...")
-        main_r, early_r = screen_stock_combined(ticker, bench_close)
+        main_r = screen_stock_combined(ticker, bench_close)
         time.sleep(0.5)
 
         if main_r:
             emit(f"  ✓ READY {ticker} — score {main_r['score']:+.3f} | RSI {main_r['signals']['momentum'].get('rsi','?')}")
             ready_candidates.append(main_r)
-        elif early_r:
-            emit(f"  ◈ SETUP {ticker} — early {early_r['early_score']:+.3f} | {early_r['setup_summary']}")
-            early_candidates.append(early_r)
         else:
             emit(f"  — {ticker} skipped")
 
-    if not ready_candidates and not early_candidates:
+    if not ready_candidates:
         emit("No results from screening.")
-        return [], []
+        return []
 
-    # ── Ready picks (top 5) ───────────────────────────────────────────────────
     # Score first, upside as the tiebreak — prefer the setup with more room to run.
     ready_candidates.sort(key=lambda x: (x["score"], x.get("target_pct", 0)), reverse=True)
     candidates = [r for r in ready_candidates if r.get("target_pct", 0) >= MIN_TARGET_PCT][:15]
 
-    enrich_valuation(candidates, ready_candidates + early_candidates, emit)
+    enrich_valuation(candidates, ready_candidates, emit)
 
     if candidates:
         emit(f"Fetching news for top {len(candidates)} candidates...")
@@ -1889,37 +1671,8 @@ def run_screening_combined(log_cb=None, abort_event=None) -> tuple[list[dict], l
         pick["screened_count"] = total
         pick["run_at"]         = run_at
 
-    # ── Watchlist / setting-up picks (saved to DB for history tab) ───────────
-    ready_tickers = {p["ticker"] for p in top5}
-    early_candidates.sort(key=lambda x: x["early_score"], reverse=True)
-    top_setup = [r for r in early_candidates if r["ticker"] not in ready_tickers][:5]
-
-    if top_setup:
-        emit(f"Fetching news for {len(top_setup)} setting-up candidates...")
-        for r in top_setup:
-            sym = r["ticker"] + ".NS"
-            articles, sentiment = fetch_news(sym)
-            r["news"]           = articles
-            r["news_sentiment"] = sentiment
-            r["early_score"]    = round(r["early_score"] + sentiment * WATCHLIST_NEWS_WEIGHT, 4)
-            if sentiment == 1:
-                wf = r.get("watch_for", "")
-                r["watch_for"] = (wf + " · Positive news catalyst").lstrip(" · ")
-            elif sentiment == -1:
-                r["setup_summary"] = r.get("setup_summary", "") + " ⚠ Neg news"
-            if articles:
-                emit(f"  {sym}: {len(articles)} article(s), sentiment {'+' if sentiment > 0 else ''}{sentiment}")
-        top_setup.sort(key=lambda x: x["early_score"], reverse=True)
-
-    for rank, pick in enumerate(top_setup, start=1):
-        pick["rank"]           = rank
-        pick["run_at"]         = run_at
-        pick["screened_count"] = total
-
-    emit(f"=== Results: {len(top5)} picks, {len(top_setup)} setting up ===")
+    emit(f"=== Results: {len(top5)} picks ===")
     for p in top5:
         emit(f"  #{p['rank']} PICK   {p['ticker']} | Score {p['score']:+.4f} | {p['sector']}")
-    for p in top_setup:
-        emit(f"  #{p['rank']} SETUP  {p['ticker']} | Early {p['early_score']:+.4f} | {p['setup_summary']}")
 
-    return top5, top_setup
+    return top5

@@ -8,7 +8,7 @@ import logging
 import os
 from datetime import datetime
 from signals import run_screening, run_screening_combined
-from database import init_db, get_today_picks, get_today_watchlist, get_history, get_watchlist_history, save_pick, save_watchlist_picks, update_outcome, check_and_update_target_hits, recalculate_all_levels
+from database import init_db, get_today_picks, get_history, save_pick, update_outcome, check_and_update_target_hits, recalculate_all_levels
 
 log = logging.getLogger(__name__)
 
@@ -65,10 +65,9 @@ def run_and_save():
         _state["logs"] = []
         _state["abort"].clear()
     try:
-        ready_picks, watchlist_picks = run_screening_combined(log_cb=_emit, abort_event=_state["abort"])
+        ready_picks = run_screening_combined(log_cb=_emit, abort_event=_state["abort"])
         for pick in ready_picks:
             save_pick(pick, rank=pick["rank"])
-        save_watchlist_picks(watchlist_picks)
         result = check_and_update_target_hits()
         if result["failed"]:
             _emit(f"Outcome check: {result['updated']} updated, skipped {result['failed']}")
@@ -204,18 +203,6 @@ def current_prices(tickers: str):
         except (Exception, SystemError) as e:
             log.warning(f"current_prices: {sym} failed — {e}")
     return result
-
-@app.get("/api/watchlist/today")
-def today_watchlist():
-    picks = get_today_watchlist()
-    if not picks:
-        return {"status": "no_picks", "picks": []}
-    return {"status": "ok", "picks": picks}
-
-@app.get("/api/watchlist/history")
-def watchlist_history():
-    rows = get_watchlist_history(limit=30)
-    return {"picks": rows}
 
 @app.get("/api/analyse")
 def analyse(ticker: str):
