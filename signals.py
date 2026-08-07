@@ -137,6 +137,17 @@ SIGNAL_WEIGHTS = {
 }
 NEWS_WEIGHT = 0.10           # Applied post-hoc to top 10 ready candidates
 
+# ── Upstream request budget ──────────────────────────────────────────────────
+# Yahoo rate-limits by IP, and a hosted runner shares its egress with everyone else
+# on the box, so the budget is far smaller than it looks from a laptop. Measured
+# cost per stock: .history() = 1 request (chart endpoint), .info = 3 (quoteSummary,
+# quote, fundamentals-timeseries — the crumb-authenticated ones Yahoo guards most).
+# Fetching .info for all 500 was ~2,000 requests a run and got blocked inside the
+# first handful of tickers, so .info is now spent only on stocks that survive the
+# price screen.
+SCREEN_REQUEST_GAP = 1.2   # seconds between stocks in the price pass
+FUNDAMENTALS_MAX   = 40    # how many survivors get the 3-request .info treatment
+
 # ── Risk / target policy ─────────────────────────────────────────────────────
 # The stop is sized in ATR units, not percent. A flat 5% cap used to put the
 # median stop ~1 ATR from entry — inside the stock's own daily range — so routine
@@ -429,6 +440,37 @@ def passes_liquidity(volume: pd.Series, close: pd.Series, min_value_cr=5.0) -> b
 
 # ── Dynamic target floor ─────────────────────────────────────────────────────
 
+def _is_rate_limit(e: Exception) -> bool:
+    msg = str(e)
+    return "Too Many Requests" in msg or "429" in msg or "YFRateLimitError" in type(e).__name__
+
+
+def _yf_retry(fn, label: str, attempts: int = 4):
+    """Call a yfinance operation, backing off on rate limits.
+
+    The old behaviour was a single flat 15s retry, which is well short of how long
+    Yahoo keeps an IP in the sin bin — the retry almost always drew a second 429 and
+    the ticker was dropped. Backoff doubles (20s, 40s, 80s) instead, and a run that
+    is genuinely blocked fails slowly rather than silently skipping most of the
+    universe. Returns None once the attempts are spent.
+    """
+    delay = 20
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except Exception as e:
+            if not _is_rate_limit(e):
+                raise
+            if attempt == attempts:
+                log.error(f"{label}: still rate limited after {attempts} attempts — giving up")
+                return None
+            log.warning(f"{label}: rate limited — backing off {delay}s "
+                        f"(attempt {attempt}/{attempts})")
+            time.sleep(delay)
+            delay *= 2
+    return None
+
+
 def _fundamental_upside_pct(fundamentals: dict) -> float:
     """
     Returns a minimum target floor in percent (12–18) driven by fundamental quality.
@@ -616,6 +658,70 @@ def _cagr(series: list) -> float | None:
     if years <= 0 or oldest <= 0 or newest <= 0:
         return None
     return round(((newest / oldest) ** (1 / years) - 1) * 100, 1)
+
+
+def enrich_fundamentals(candidates: list[dict], emit=None) -> int:
+    """Attach company, sector and fundamentals to candidates that cleared the price
+    screen, and lift their target to the fundamental floor.
+
+    Split out of the per-stock screen so `.info` — three requests each, against the
+    endpoints Yahoo rate-limits hardest — is spent only on stocks that survived,
+    typically a few dozen rather than all 500. A stock whose `.info` cannot be
+    fetched keeps its price-derived levels and an empty fundamentals block; the
+    downstream summary generators already treat that as "no data" rather than failing.
+    """
+    def say(m):
+        log.info(m)
+        if emit:
+            emit(m)
+
+    def _pct(v):
+        return round(v * 100, 1) if v is not None else None
+
+    done = 0
+    for i, r in enumerate(candidates):
+        sym = r["ticker"] + ".NS"
+        try:
+            info = _yf_retry(lambda: yf.Ticker(sym).info, sym) or {}
+        except (Exception, SystemError) as e:
+            log.warning(f"fundamentals: {sym} — {e}")
+            info = {}
+        if not info:
+            continue
+
+        r["company"] = info.get("longName") or info.get("shortName") or r["ticker"]
+        r["sector"]  = info.get("sector") or info.get("industry") or "N/A"
+
+        cap_raw = info.get("marketCap")
+        fundamentals = {
+            "market_cap_cr":   round(cap_raw / 1e7) if cap_raw else None,
+            "pe":              round(info["trailingPE"], 1) if info.get("trailingPE") else None,
+            "price_to_book":   round(info["priceToBook"], 2) if info.get("priceToBook") else None,
+            "pe_fwd":          round(info["forwardPE"], 1)  if info.get("forwardPE")  else None,
+            "eps":             round(info["trailingEps"], 2) if info.get("trailingEps") else None,
+            "rev_growth":      _pct(info.get("revenueGrowth")),
+            "earnings_growth": _pct(info.get("earningsGrowth")),
+            "profit_margin":   _pct(info.get("profitMargins")),
+            "gross_margin":    _pct(info.get("grossMargins")),
+            "roe":             _pct(info.get("returnOnEquity")),
+            "debt_to_equity":  round(info["debtToEquity"], 2) if info.get("debtToEquity") else None,
+        }
+        fundamentals["summary"] = generate_fundamentals_summary(fundamentals)
+        r["fundamentals"] = fundamentals
+
+        floor_pct  = _fundamental_upside_pct(fundamentals)
+        r["fundamental_floor_pct"] = floor_pct
+        fund_floor = r["price"] * (1 + floor_pct / 100)
+        if fund_floor > r["target"]:
+            _apply_target(r, fund_floor)
+
+        done += 1
+        time.sleep(1.0)
+        if (i + 1) % 20 == 0:
+            say(f"  fundamentals: {i + 1}/{len(candidates)}")
+
+    say(f"Fundamentals resolved: {done}/{len(candidates)}")
+    return done
 
 
 def build_peer_stats(results: list[dict]) -> dict:
@@ -1219,13 +1325,22 @@ def generate_fundamentals_summary(f: dict) -> str:
 
 def screen_stock_combined(ticker: str, bench_close: pd.Series, _retry: bool = True) -> dict | None:
     """
-    Single yfinance fetch. Evaluates the confirmatory signals and returns the pick,
-    or None if the stock does not qualify.
+    Price-only screen over one stock: exactly ONE upstream request (the chart
+    endpoint). Returns a candidate with signals and ATR trade levels, or None.
+
+    Fundamentals are deliberately NOT fetched here. `.info` costs three more
+    requests per ticker against the crumb-authenticated endpoints Yahoo throttles
+    hardest, and over a 500-name universe that was 1,500 of the run's 2,000
+    requests — enough to get the whole run rate-limited within the first handful
+    of tickers. Nothing in this function's accept/reject decision uses them:
+    the score is price-derived, and the fundamental target floor only ever RAISES
+    a target that is already >= MIN_TARGET_PCT by construction. So fundamentals
+    are fetched later, for survivors only, by enrich_fundamentals().
     """
     try:
         info_obj = yf.Ticker(ticker)
-        df = info_obj.history(period="1y", actions=False)
-        if df.empty or len(df) < 50:
+        df = _yf_retry(lambda: info_obj.history(period="1y", actions=False), ticker)
+        if df is None or df.empty or len(df) < 50:
             return None
 
         df = df.reset_index(drop=True)
@@ -1254,48 +1369,17 @@ def screen_stock_combined(ticker: str, bench_close: pd.Series, _retry: bool = Tr
         if pct_from_high >= 0 or pct_from_high < -25:
             return None
 
-        # ── Shared fundamentals & trade levels ──────────────────────────────
-        info    = info_obj.info
-        company = info.get("longName") or info.get("shortName") or ticker
-        sector  = info.get("sector") or info.get("industry") or "N/A"
-
-        def _pct(v):
-            return round(v * 100, 1) if v is not None else None
-
-        cap_raw = info.get("marketCap")
-        fundamentals = {
-            "market_cap_cr":   round(cap_raw / 1e7) if cap_raw else None,
-            "pe":              round(info["trailingPE"], 1) if info.get("trailingPE") else None,
-            "price_to_book":   round(info["priceToBook"], 2) if info.get("priceToBook") else None,
-            "pe_fwd":          round(info["forwardPE"], 1)  if info.get("forwardPE")  else None,
-            "eps":             round(info["trailingEps"], 2) if info.get("trailingEps") else None,
-            "rev_growth":      _pct(info.get("revenueGrowth")),
-            "earnings_growth": _pct(info.get("earningsGrowth")),
-            "profit_margin":   _pct(info.get("profitMargins")),
-            "gross_margin":    _pct(info.get("grossMargins")),
-            "roe":             _pct(info.get("returnOnEquity")),
-            "debt_to_equity":  round(info["debtToEquity"], 2) if info.get("debtToEquity") else None,
-        }
-        fundamentals["summary"] = generate_fundamentals_summary(fundamentals)
-
-        trade     = compute_trade_levels(close, high, low)
-        floor_pct = _fundamental_upside_pct(fundamentals)
-        fund_floor = price * (1 + floor_pct / 100)
-        if fund_floor > trade["target"]:
-            risk = price - trade["stop_loss"]
-            trade["target"]          = round(fund_floor, 2)
-            trade["target_pct"]      = round(floor_pct, 1)
-            trade["rr_ratio"]        = round((fund_floor - price) / risk, 2) if risk > 0 else 2.0
-            atr = trade["atr_14"]
-            trade["target_days_est"] = max(5, min(45, round((fund_floor - price) / atr * 2))) if atr > 0 else 10
+        # Trade levels are price-derived. The fundamental floor is applied later, in
+        # enrich_fundamentals(), once we know this stock is worth spending `.info` on.
+        trade = compute_trade_levels(close, high, low)
 
         base = {
             "ticker":                ticker.replace(".NS", ""),
-            "company":               company,
-            "sector":                sector,
+            "company":               ticker.replace(".NS", ""),   # replaced at enrichment
+            "sector":                "N/A",                        # replaced at enrichment
             "price":                 round(price, 2),
-            "fundamentals":          fundamentals,
-            "fundamental_floor_pct": floor_pct,
+            "fundamentals":          {},
+            "fundamental_floor_pct": MIN_TARGET_PCT,
             **trade,
         }
 
@@ -1608,7 +1692,11 @@ def run_screening_combined(log_cb=None, abort_event=None) -> list[dict]:
     emit(f"Universe: {len(watchlist)} stocks")
 
     emit("Fetching Nifty 50 benchmark data...")
-    bench_df = yf.Ticker(BENCHMARK).history(period="3mo", actions=False)
+    bench_df = _yf_retry(lambda: yf.Ticker(BENCHMARK).history(period="3mo", actions=False),
+                         BENCHMARK)
+    if bench_df is None:
+        emit("Benchmark fetch is rate limited — aborting before burning the run.")
+        return []
     bench_close = bench_df["Close"] if not bench_df.empty else pd.Series(dtype=float)
     if bench_df.empty:
         emit("Warning: benchmark unavailable, relative strength skipped.")
@@ -1616,6 +1704,8 @@ def run_screening_combined(log_cb=None, abort_event=None) -> list[dict]:
     total = len(watchlist)
     ready_candidates = []
 
+    # ── Phase 1: price-only pass over the universe (1 request per stock) ──────
+    emit(f"Phase 1: price screen over {total} stocks...")
     for i, ticker in enumerate(watchlist):
         if abort_event and abort_event.is_set():
             emit("Aborted by user.")
@@ -1623,7 +1713,7 @@ def run_screening_combined(log_cb=None, abort_event=None) -> list[dict]:
 
         emit(f"[{i+1}/{total}] {ticker}...")
         main_r = screen_stock_combined(ticker, bench_close)
-        time.sleep(0.5)
+        time.sleep(SCREEN_REQUEST_GAP)
 
         if main_r:
             emit(f"  ✓ READY {ticker} — score {main_r['score']:+.3f} | RSI {main_r['signals']['momentum'].get('rsi','?')}")
@@ -1637,9 +1727,18 @@ def run_screening_combined(log_cb=None, abort_event=None) -> list[dict]:
 
     # Score first, upside as the tiebreak — prefer the setup with more room to run.
     ready_candidates.sort(key=lambda x: (x["score"], x.get("target_pct", 0)), reverse=True)
-    candidates = [r for r in ready_candidates if r.get("target_pct", 0) >= MIN_TARGET_PCT][:15]
 
-    enrich_valuation(candidates, ready_candidates, emit)
+    # ── Phase 2: fundamentals, survivors only ────────────────────────────────
+    # Capped because `.info` is the expensive call. The cap is well above the 15 that
+    # go on to valuation so the sector peer cohorts still have bodies in them.
+    fundamental_set = ready_candidates[:FUNDAMENTALS_MAX]
+    emit(f"Phase 2: fundamentals for {len(fundamental_set)} of {len(ready_candidates)} survivors...")
+    enrich_fundamentals(fundamental_set, emit)
+
+    fundamental_set.sort(key=lambda x: (x["score"], x.get("target_pct", 0)), reverse=True)
+    candidates = [r for r in fundamental_set if r.get("target_pct", 0) >= MIN_TARGET_PCT][:15]
+
+    enrich_valuation(candidates, fundamental_set, emit)
 
     if candidates:
         emit(f"Fetching news for top {len(candidates)} candidates...")
