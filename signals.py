@@ -24,6 +24,7 @@ import certifi
 import io
 import time
 import statistics
+import collections
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -671,9 +672,11 @@ def enrich_fundamentals(candidates: list[dict], emit=None) -> int:
     downstream summary generators already treat that as "no data" rather than failing.
     """
     def say(m):
-        log.info(m)
+        # emit() already logs; calling both would double every line in the run log.
         if emit:
             emit(m)
+        else:
+            log.info(m)
 
     def _pct(v):
         return round(v * 100, 1) if v is not None else None
@@ -885,9 +888,11 @@ def enrich_valuation(shortlist: list[dict], universe: list[dict], emit=None) -> 
     Failures are per-stock and non-fatal: a missing valuation must never cost a pick.
     """
     def say(m):
-        log.info(m)
+        # emit() already logs; calling both would double every line in the run log.
         if emit:
             emit(m)
+        else:
+            log.info(m)
 
     if not shortlist:
         return 0
@@ -1323,10 +1328,38 @@ def generate_fundamentals_summary(f: dict) -> str:
 
 # ── Single-stock screen (one yfinance fetch) ─────────────────────────────────
 
-def screen_stock_combined(ticker: str, bench_close: pd.Series, _retry: bool = True) -> dict | None:
+# Rejection reasons are written per-stock for the log; these group them for the
+# end-of-phase tally. Matched on a distinctive fragment of each reason above —
+# keep the two in step if you reword one.
+_REJECT_BUCKETS = (
+    ("rate limited",  "rate limited"),
+    ("fetch failed",  "fetch failed"),
+    ("no price data", "no data"),
+    ("sessions",      "too little history"),
+    ("illiquid",      "illiquid"),
+    ("52W high",      "outside the setup zone"),
+    ("already moving", "already moving"),
+    ("signals net",   "signals negative"),
+    ("upside",        "not enough upside"),
+)
+
+
+def _reject_bucket(reason: str) -> str:
+    for fragment, bucket in _REJECT_BUCKETS:
+        if fragment in reason:
+            return bucket
+    return "other"
+
+
+def screen_stock_combined(ticker: str, bench_close: pd.Series) -> tuple[dict | None, str]:
     """
     Price-only screen over one stock: exactly ONE upstream request (the chart
-    endpoint). Returns a candidate with signals and ATR trade levels, or None.
+    endpoint). Returns (candidate, "") when it qualifies, or (None, reason).
+
+    The reason is written for the run log. "Skipped" told you nothing — a stock the
+    screen rejected on its signals, one that never had enough history, and one whose
+    fetch was rate-limited all looked identical, which made a run that was quietly
+    failing indistinguishable from one that was working. Every exit names itself.
 
     Fundamentals are deliberately NOT fetched here. `.info` costs three more
     requests per ticker against the crumb-authenticated endpoints Yahoo throttles
@@ -1340,15 +1373,19 @@ def screen_stock_combined(ticker: str, bench_close: pd.Series, _retry: bool = Tr
     try:
         info_obj = yf.Ticker(ticker)
         df = _yf_retry(lambda: info_obj.history(period="1y", actions=False), ticker)
-        if df is None or df.empty or len(df) < 50:
-            return None
+        if df is None:
+            return None, "rate limited — no data"
+        if df.empty:
+            return None, "no price data from the feed"
+        if len(df) < 50:
+            return None, f"only {len(df)} sessions of history — needs 50"
 
         df = df.reset_index(drop=True)
         for col in ("Close", "High", "Low", "Volume"):
             df[col] = pd.to_numeric(df[col], errors="coerce")
         df = df.dropna(subset=["Close", "High", "Low", "Volume"])
         if len(df) < 50:
-            return None
+            return None, f"only {len(df)} clean sessions after dropping gaps — needs 50"
 
         close  = df["Close"]
         high   = df["High"]
@@ -1356,7 +1393,8 @@ def screen_stock_combined(ticker: str, bench_close: pd.Series, _retry: bool = Tr
         volume = df["Volume"]
 
         if not passes_liquidity(volume, close):
-            return None
+            traded_cr = float((volume.iloc[-21:-1] * close.iloc[-21:-1]).mean()) / 1e7
+            return None, f"too illiquid — ₹{traded_cr:.1f} Cr traded daily, floor is ₹5 Cr"
 
         price    = float(close.iloc[-1])
         high_52w = float(high.iloc[-252:].max()) if len(high) >= 252 else float(high.max())
@@ -1366,8 +1404,10 @@ def screen_stock_combined(ticker: str, bench_close: pd.Series, _retry: bool = Tr
         # Only consider stocks that are 1–25% below their 52W high.
         # ≥ 0  → already broken out and running; skip.
         # < -25 → too far from the setup zone; skip.
-        if pct_from_high >= 0 or pct_from_high < -25:
-            return None
+        if pct_from_high >= 0:
+            return None, f"already at its 52W high (₹{high_52w:.0f}) — the move has gone"
+        if pct_from_high < -25:
+            return None, f"{abs(pct_from_high):.0f}% below its 52W high — no base to break out of"
 
         # Trade levels are price-derived. The fundamental floor is applied later, in
         # enrich_fundamentals(), once we know this stock is worth spending `.info` on.
@@ -1395,8 +1435,10 @@ def screen_stock_combined(ticker: str, bench_close: pd.Series, _retry: bool = Tr
         # to be early, so a stock that has already run is not a candidate.
         rsi_val   = d_mom.get("rsi", 50) or 50
         vol_ratio = d_vol.get("vol_ratio", 1.0) or 1.0
-        if rsi_val > 60 or vol_ratio > 1.5:
-            return None
+        if rsi_val > 60:
+            return None, f"already moving — RSI {rsi_val:.0f} is past the 60 entry ceiling"
+        if vol_ratio > 1.5:
+            return None, f"already moving — volume {vol_ratio:.1f}× average, the crowd is in"
 
         main_score = (
             s_trend  * SIGNAL_WEIGHTS["trend"]        +
@@ -1406,8 +1448,17 @@ def screen_stock_combined(ticker: str, bench_close: pd.Series, _retry: bool = Tr
             s_rs     * SIGNAL_WEIGHTS["rel_strength"]
         )
 
-        if main_score <= 0 or trade.get("target_pct", 0) < MIN_TARGET_PCT:
-            return None
+        if main_score <= 0:
+            # Name the signals that dragged it under, so the log says what was wrong
+            # with the setup rather than just that it lost.
+            weak = [n for n, s in (("trend", s_trend), ("momentum", s_mom), ("volume", s_vol),
+                                   ("breakout", s_break), ("rel strength", s_rs)) if s < 0]
+            detail = f" — negative on {', '.join(weak)}" if weak else " — nothing firing"
+            return None, f"signals net {main_score:+.2f}{detail}"
+
+        if trade.get("target_pct", 0) < MIN_TARGET_PCT:
+            return None, (f"only {trade.get('target_pct', 0):.1f}% upside to target — "
+                          f"floor is {MIN_TARGET_PCT:.0f}%")
 
         return {
             **base,
@@ -1419,16 +1470,11 @@ def screen_stock_combined(ticker: str, bench_close: pd.Series, _retry: bool = Tr
                 "breakout":     {"score": s_break,  **d_break},
                 "rel_strength": {"score": s_rs,     **d_rs},
             },
-        }
+        }, ""
 
     except Exception as e:
-        msg = str(e)
-        if ("Too Many Requests" in msg or "429" in msg) and _retry:
-            log.warning(f"{ticker}: rate limited — waiting 15s before retry")
-            time.sleep(15)
-            return screen_stock_combined(ticker, bench_close, _retry=False)
         log.error(f"{ticker}: screen error — {e}")
-        return None
+        return None, f"fetch failed — {type(e).__name__}"
 
 
 # ── Single-stock deep analysis ────────────────────────────────────────────────
@@ -1703,6 +1749,7 @@ def run_screening_combined(log_cb=None, abort_event=None) -> list[dict]:
 
     total = len(watchlist)
     ready_candidates = []
+    rejected = collections.Counter()
 
     # ── Phase 1: price-only pass over the universe (1 request per stock) ──────
     emit(f"Phase 1: price screen over {total} stocks...")
@@ -1712,14 +1759,25 @@ def run_screening_combined(log_cb=None, abort_event=None) -> list[dict]:
             break
 
         emit(f"[{i+1}/{total}] {ticker}...")
-        main_r = screen_stock_combined(ticker, bench_close)
+        main_r, reason = screen_stock_combined(ticker, bench_close)
         time.sleep(SCREEN_REQUEST_GAP)
 
         if main_r:
             emit(f"  ✓ READY {ticker} — score {main_r['score']:+.3f} | RSI {main_r['signals']['momentum'].get('rsi','?')}")
             ready_candidates.append(main_r)
         else:
-            emit(f"  — {ticker} skipped")
+            rejected[_reject_bucket(reason)] += 1
+            emit(f"  ✕ {ticker} — {reason}")
+
+    # A tally beats scrolling 500 lines: it says at a glance whether the run screened
+    # properly or was quietly starved of data.
+    if rejected:
+        tally = ", ".join(f"{n} {bucket}" for bucket, n in rejected.most_common())
+        emit(f"Phase 1 done: {len(ready_candidates)} passed, {sum(rejected.values())} rejected — {tally}.")
+    starved = rejected["rate limited"] + rejected["fetch failed"] + rejected["no data"]
+    if starved > total * 0.2:
+        emit(f"WARNING: {starved} of {total} stocks failed to fetch — this run saw only "
+             f"part of the universe and its picks are not a full screen.")
 
     if not ready_candidates:
         emit("No results from screening.")
