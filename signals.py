@@ -14,6 +14,7 @@ Each signal is scored -1 / 0 / +1. Composite score = weighted sum.
 """
 
 import yfinance as yf
+import yfinance.data as yfd   # batched quote endpoint; see fetch_quote_batch()
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta, timezone
@@ -147,7 +148,13 @@ NEWS_WEIGHT = 0.10           # Applied post-hoc to top 10 ready candidates
 # first handful of tickers, so .info is now spent only on stocks that survive the
 # price screen.
 SCREEN_REQUEST_GAP = 1.2   # seconds between stocks in the price pass
-FUNDAMENTALS_MAX   = 40    # how many survivors get the 3-request .info treatment
+FUNDAMENTALS_GAP   = 3.0   # seconds between .info calls — 3 requests fire per call
+FUNDAMENTALS_MAX   = 25    # how many survivors get the 3-request .info treatment
+QUOTE_BATCH_SIZE   = 50    # symbols per batched quote request
+# Consecutive rate-limited stocks before phase 2 gives up. Without this a blocked
+# run spends 140s of backoff on every remaining stock — over half an hour of
+# hammering an endpoint that has already said no — and still ends with nothing.
+FUNDAMENTALS_ABORT_AFTER = 3
 
 # ── Risk / target policy ─────────────────────────────────────────────────────
 # The stop is sized in ATR units, not percent. A flat 5% cap used to put the
@@ -446,6 +453,41 @@ def _is_rate_limit(e: Exception) -> bool:
     return "Too Many Requests" in msg or "429" in msg or "YFRateLimitError" in type(e).__name__
 
 
+def _fetch_history(tk, label: str, period: str = "1y", attempts: int = 3):
+    """Price history, treating an empty frame as a probable throttle.
+
+    yfinance does NOT raise when Yahoo throttles the chart endpoint. It logs
+    "possibly delisted; no price data found" and returns an empty DataFrame, which
+    is indistinguishable from a genuinely dead ticker. Taking that at face value
+    made a rate-limited run look like a universe full of delisted stocks — a 60-stock
+    trial reported 40 "no data" while every one of those tickers fetched fine when
+    retried on its own.
+
+    So an empty frame is retried with backoff. A ticker that is really delisted just
+    costs a couple of extra attempts; a throttled one gets the pause it needs.
+    Returns (df, was_throttled) — the caller needs the difference to log honestly.
+    """
+    delay = 15
+    for attempt in range(1, attempts + 1):
+        try:
+            df = tk.history(period=period, actions=False)
+        except Exception as e:
+            if not _is_rate_limit(e):
+                raise
+            df = None
+
+        if df is not None and not df.empty:
+            return df, False
+        if attempt == attempts:
+            return df, True
+
+        log.warning(f"{label}: empty/blocked response — retrying in {delay}s "
+                    f"(attempt {attempt}/{attempts})")
+        time.sleep(delay)
+        delay *= 2
+    return None, True
+
+
 def _yf_retry(fn, label: str, attempts: int = 4):
     """Call a yfinance operation, backing off on rate limits.
 
@@ -661,6 +703,100 @@ def _cagr(series: list) -> float | None:
     return round(((newest / oldest) ** (1 / years) - 1) * 100, 1)
 
 
+_BENCH_CACHE: dict = {"at": None, "series": None}
+_BENCH_TTL_SEC = 3600
+
+
+def _cached_benchmark() -> pd.Series:
+    """Nifty close series, refetched at most once an hour.
+
+    The Analyse endpoint is user-triggered and was pulling the benchmark on every
+    single call. The index moves slowly and the series is identical for every user,
+    so caching it removes a whole request per Analyse without changing any number.
+    """
+    now = time.time()
+    if _BENCH_CACHE["series"] is not None and now - _BENCH_CACHE["at"] < _BENCH_TTL_SEC:
+        return _BENCH_CACHE["series"]
+
+    df, _ = _fetch_history(yf.Ticker(BENCHMARK), BENCHMARK, period="3mo", attempts=3)
+    if df is None or df.empty:
+        # Serve a stale series rather than silently dropping relative strength.
+        return _BENCH_CACHE["series"] if _BENCH_CACHE["series"] is not None else pd.Series(dtype=float)
+
+    df = df.reset_index(drop=True)
+    series = pd.to_numeric(df["Close"], errors="coerce").dropna()
+    _BENCH_CACHE.update({"at": now, "series": series})
+    return series
+
+
+def fetch_quote_batch(symbols: list[str]) -> dict[str, dict]:
+    """Valuation basics for many symbols at once.
+
+    Yahoo's quote endpoint takes a symbols list and answers for all of them in ONE
+    request, unlike `.info` which costs three per stock. It carries marketCap, both
+    PEs, price/book, EPS and the long name — everything the peer cohort and the
+    valuation display need. It does NOT carry sector, margins, growth or ROE; those
+    live in quoteSummary modules and still need a per-stock call.
+    """
+    out: dict[str, dict] = {}
+    data = yfd.YfData()
+    for i in range(0, len(symbols), QUOTE_BATCH_SIZE):
+        chunk = symbols[i:i + QUOTE_BATCH_SIZE]
+        try:
+            j = _yf_retry(
+                lambda: data.get_raw_json(
+                    "https://query2.finance.yahoo.com/v7/finance/quote",
+                    params={"symbols": ",".join(chunk)},
+                ),
+                f"quote batch {i // QUOTE_BATCH_SIZE + 1}",
+                attempts=3,
+            )
+            if not j:
+                continue
+            for row in j.get("quoteResponse", {}).get("result", []):
+                sym = row.get("symbol")
+                if sym:
+                    out[sym] = row
+        except Exception as e:
+            log.warning(f"quote batch failed — {e}")
+        time.sleep(1.0)
+    return out
+
+
+def enrich_quotes(candidates: list[dict], emit=None) -> int:
+    """Fill company name and valuation basics for every survivor, cheaply.
+
+    One request per 50 stocks, so the whole survivor set can be covered for the price
+    of a couple of calls. Stocks that never get a full `.info` still end up with a
+    name and a PE rather than a bare ticker.
+    """
+    if not candidates:
+        return 0
+    quotes = fetch_quote_batch([r["ticker"] + ".NS" for r in candidates])
+    done = 0
+    for r in candidates:
+        q = quotes.get(r["ticker"] + ".NS")
+        if not q:
+            continue
+        r["company"] = q.get("longName") or q.get("shortName") or r["ticker"]
+        cap = q.get("marketCap")
+        f = dict(r.get("fundamentals") or {})
+        f.update({
+            "market_cap_cr": round(cap / 1e7) if cap else None,
+            "pe":            round(q["trailingPE"], 1) if q.get("trailingPE") else None,
+            "pe_fwd":        round(q["forwardPE"], 1) if q.get("forwardPE") else None,
+            "price_to_book": round(q["priceToBook"], 2) if q.get("priceToBook") else None,
+            "eps":           round(q["epsTrailingTwelveMonths"], 2) if q.get("epsTrailingTwelveMonths") else None,
+        })
+        r["fundamentals"] = f
+        done += 1
+    msg = f"Quote basics resolved: {done}/{len(candidates)} (1 request per {QUOTE_BATCH_SIZE})"
+    log.info(msg)
+    if emit:
+        emit(msg)
+    return done
+
+
 def enrich_fundamentals(candidates: list[dict], emit=None) -> int:
     """Attach company, sector and fundamentals to candidates that cleared the price
     screen, and lift their target to the fundamental floor.
@@ -682,6 +818,7 @@ def enrich_fundamentals(candidates: list[dict], emit=None) -> int:
         return round(v * 100, 1) if v is not None else None
 
     done = 0
+    consecutive_blocks = 0
     for i, r in enumerate(candidates):
         sym = r["ticker"] + ".NS"
         try:
@@ -689,26 +826,41 @@ def enrich_fundamentals(candidates: list[dict], emit=None) -> int:
         except (Exception, SystemError) as e:
             log.warning(f"fundamentals: {sym} — {e}")
             info = {}
-        if not info:
-            continue
 
-        r["company"] = info.get("longName") or info.get("shortName") or r["ticker"]
-        r["sector"]  = info.get("sector") or info.get("industry") or "N/A"
+        if not info:
+            # _yf_retry has already exhausted its backoff on this one, so an empty
+            # result here means the endpoint is refusing us, not that the stock is
+            # obscure. Keep count and stop rather than grinding through the rest.
+            consecutive_blocks += 1
+            if consecutive_blocks >= FUNDAMENTALS_ABORT_AFTER:
+                say(f"Fundamentals abandoned after {consecutive_blocks} rate-limited stocks "
+                    f"in a row — {done} of {len(candidates)} resolved. Picks keep their "
+                    f"price-derived levels; valuation detail will be thin.")
+                break
+            continue
+        consecutive_blocks = 0
+
+        r["sector"] = info.get("sector") or info.get("industry") or "N/A"
+        if info.get("longName") or info.get("shortName"):
+            r["company"] = info.get("longName") or info.get("shortName")
 
         cap_raw = info.get("marketCap")
-        fundamentals = {
-            "market_cap_cr":   round(cap_raw / 1e7) if cap_raw else None,
-            "pe":              round(info["trailingPE"], 1) if info.get("trailingPE") else None,
-            "price_to_book":   round(info["priceToBook"], 2) if info.get("priceToBook") else None,
-            "pe_fwd":          round(info["forwardPE"], 1)  if info.get("forwardPE")  else None,
-            "eps":             round(info["trailingEps"], 2) if info.get("trailingEps") else None,
+        # Merged over whatever the batch quote already supplied, so a partial `.info`
+        # cannot blank out fields that were fetched cheaply.
+        fundamentals = dict(r.get("fundamentals") or {})
+        fundamentals.update({
+            "market_cap_cr":   round(cap_raw / 1e7) if cap_raw else fundamentals.get("market_cap_cr"),
+            "pe":              round(info["trailingPE"], 1) if info.get("trailingPE") else fundamentals.get("pe"),
+            "price_to_book":   round(info["priceToBook"], 2) if info.get("priceToBook") else fundamentals.get("price_to_book"),
+            "pe_fwd":          round(info["forwardPE"], 1)  if info.get("forwardPE")  else fundamentals.get("pe_fwd"),
+            "eps":             round(info["trailingEps"], 2) if info.get("trailingEps") else fundamentals.get("eps"),
             "rev_growth":      _pct(info.get("revenueGrowth")),
             "earnings_growth": _pct(info.get("earningsGrowth")),
             "profit_margin":   _pct(info.get("profitMargins")),
             "gross_margin":    _pct(info.get("grossMargins")),
             "roe":             _pct(info.get("returnOnEquity")),
             "debt_to_equity":  round(info["debtToEquity"], 2) if info.get("debtToEquity") else None,
-        }
+        })
         fundamentals["summary"] = generate_fundamentals_summary(fundamentals)
         r["fundamentals"] = fundamentals
 
@@ -719,11 +871,12 @@ def enrich_fundamentals(candidates: list[dict], emit=None) -> int:
             _apply_target(r, fund_floor)
 
         done += 1
-        time.sleep(1.0)
-        if (i + 1) % 20 == 0:
+        time.sleep(FUNDAMENTALS_GAP)
+        if (i + 1) % 10 == 0:
             say(f"  fundamentals: {i + 1}/{len(candidates)}")
 
-    say(f"Fundamentals resolved: {done}/{len(candidates)}")
+    if consecutive_blocks < FUNDAMENTALS_ABORT_AFTER:
+        say(f"Fundamentals resolved: {done}/{len(candidates)}")
     return done
 
 
@@ -1332,6 +1485,7 @@ def generate_fundamentals_summary(f: dict) -> str:
 # end-of-phase tally. Matched on a distinctive fragment of each reason above —
 # keep the two in step if you reword one.
 _REJECT_BUCKETS = (
+    ("throttled",     "throttled"),
     ("rate limited",  "rate limited"),
     ("fetch failed",  "fetch failed"),
     ("no price data", "no data"),
@@ -1372,11 +1526,12 @@ def screen_stock_combined(ticker: str, bench_close: pd.Series) -> tuple[dict | N
     """
     try:
         info_obj = yf.Ticker(ticker)
-        df = _yf_retry(lambda: info_obj.history(period="1y", actions=False), ticker)
-        if df is None:
-            return None, "rate limited — no data"
-        if df.empty:
-            return None, "no price data from the feed"
+        df, throttled = _fetch_history(info_obj, ticker)
+        if df is None or df.empty:
+            # Distinguished so the run tally can tell a thin universe from a blocked
+            # one — they used to look identical in the log.
+            return None, ("throttled — no data after retries" if throttled
+                          else "no price data from the feed")
         if len(df) < 50:
             return None, f"only {len(df)} sessions of history — needs 50"
 
@@ -1490,8 +1645,11 @@ def analyse_stock(ticker_sym: str) -> dict:
 
     try:
         info_obj = yf.Ticker(full_sym)
-        df = info_obj.history(period="1y", actions=False)
-        if df.empty or len(df) < 20:
+        df, throttled = _fetch_history(info_obj, full_sym)
+        if (df is None or df.empty) and throttled:
+            return {"error": f"Yahoo is rate limiting us right now — try {ticker} again "
+                             f"in a few minutes."}
+        if df is None or df.empty or len(df) < 20:
             return {"error": f"No data found for {ticker}. Check the NSE symbol."}
 
         df = df.reset_index(drop=True)
@@ -1507,12 +1665,9 @@ def analyse_stock(ticker_sym: str) -> dict:
         volume = df["Volume"]
         price  = float(close.iloc[-1])
 
-        # Benchmark for relative strength
-        bench_df = yf.Ticker(BENCHMARK).history(period="3mo", actions=False)
-        if not bench_df.empty:
-            bench_df = bench_df.reset_index(drop=True)
-            bench_df["Close"] = pd.to_numeric(bench_df["Close"], errors="coerce")
-        bench_close = bench_df["Close"].dropna() if not bench_df.empty else pd.Series(dtype=float)
+        # Benchmark for relative strength. Cached across calls — every Analyse hit was
+        # re-fetching the same Nifty series, which is pure waste against a rate limit.
+        bench_close = _cached_benchmark()
 
         # Technical signals
         s_trend,  d_trend  = signal_trend(close)
@@ -1536,8 +1691,9 @@ def analyse_stock(ticker_sym: str) -> dict:
         high_52w = round(float(high.max()), 2)
         low_52w  = round(float(low.min()),  2)
 
-        # Fundamentals
-        info    = info_obj.info
+        # Fundamentals. Not fatal if throttled — the price-derived half of the
+        # analysis is still worth returning, so this degrades instead of erroring.
+        info    = _yf_retry(lambda: info_obj.info, f"{full_sym} .info", attempts=2) or {}
         company = info.get("longName") or info.get("shortName") or ticker
         sector  = info.get("sector") or info.get("industry") or "N/A"
         cap_raw = info.get("marketCap")
@@ -1615,11 +1771,14 @@ def analyse_stock(ticker_sym: str) -> dict:
         result["score_basis"] = generate_score_basis(result)
         # No peer cohort here — that is built from a full screen, so the on-demand
         # analysis gets the absolute valuation block without the relative comparison.
+        # Statements are two more requests on top of .info; skip them entirely when
+        # .info already came back empty, since that means we are being throttled.
         try:
-            result["valuation"] = compute_valuation_case(
-                info, price, sector,
-                income_stmt=info_obj.income_stmt, balance_sheet=info_obj.balance_sheet,
-            )
+            if info:
+                result["valuation"] = compute_valuation_case(
+                    info, price, sector,
+                    income_stmt=info_obj.income_stmt, balance_sheet=info_obj.balance_sheet,
+                )
         except (Exception, SystemError) as e:
             log.warning(f"analyse_stock valuation: {full_sym} — {e}")
         return result
@@ -1738,14 +1897,10 @@ def run_screening_combined(log_cb=None, abort_event=None) -> list[dict]:
     emit(f"Universe: {len(watchlist)} stocks")
 
     emit("Fetching Nifty 50 benchmark data...")
-    bench_df = _yf_retry(lambda: yf.Ticker(BENCHMARK).history(period="3mo", actions=False),
-                         BENCHMARK)
-    if bench_df is None:
-        emit("Benchmark fetch is rate limited — aborting before burning the run.")
+    bench_close = _cached_benchmark()
+    if bench_close.empty:
+        emit("Benchmark is unreachable or throttled — aborting before burning the run.")
         return []
-    bench_close = bench_df["Close"] if not bench_df.empty else pd.Series(dtype=float)
-    if bench_df.empty:
-        emit("Warning: benchmark unavailable, relative strength skipped.")
 
     total = len(watchlist)
     ready_candidates = []
@@ -1774,7 +1929,8 @@ def run_screening_combined(log_cb=None, abort_event=None) -> list[dict]:
     if rejected:
         tally = ", ".join(f"{n} {bucket}" for bucket, n in rejected.most_common())
         emit(f"Phase 1 done: {len(ready_candidates)} passed, {sum(rejected.values())} rejected — {tally}.")
-    starved = rejected["rate limited"] + rejected["fetch failed"] + rejected["no data"]
+    starved = (rejected["throttled"] + rejected["rate limited"]
+               + rejected["fetch failed"] + rejected["no data"])
     if starved > total * 0.2:
         emit(f"WARNING: {starved} of {total} stocks failed to fetch — this run saw only "
              f"part of the universe and its picks are not a full screen.")
@@ -1786,11 +1942,15 @@ def run_screening_combined(log_cb=None, abort_event=None) -> list[dict]:
     # Score first, upside as the tiebreak — prefer the setup with more room to run.
     ready_candidates.sort(key=lambda x: (x["score"], x.get("target_pct", 0)), reverse=True)
 
-    # ── Phase 2: fundamentals, survivors only ────────────────────────────────
-    # Capped because `.info` is the expensive call. The cap is well above the 15 that
-    # go on to valuation so the sector peer cohorts still have bodies in them.
+    # ── Phase 2a: batched quote for every survivor (1 request per 50) ────────
+    emit(f"Phase 2a: quote basics for all {len(ready_candidates)} survivors...")
+    enrich_quotes(ready_candidates, emit)
+
+    # ── Phase 2b: full fundamentals, top slice only ──────────────────────────
+    # `.info` is three crumb-authenticated requests each — the most rate-limited
+    # thing this run does — so it is spent on the head of the list, not the tail.
     fundamental_set = ready_candidates[:FUNDAMENTALS_MAX]
-    emit(f"Phase 2: fundamentals for {len(fundamental_set)} of {len(ready_candidates)} survivors...")
+    emit(f"Phase 2b: full fundamentals for the top {len(fundamental_set)}...")
     enrich_fundamentals(fundamental_set, emit)
 
     fundamental_set.sort(key=lambda x: (x["score"], x.get("target_pct", 0)), reverse=True)
