@@ -9,6 +9,13 @@ log = logging.getLogger(__name__)
 
 _DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
+# A fresh pick gets room to breathe. For the first SL_GRACE_DAYS calendar days
+# after the call the ordinary stop is ignored and only a break of twice the risk
+# (entry - 2R, SL_GRACE_MULT × the stop distance) resolves the pick as a miss.
+# From day SL_GRACE_DAYS + 1 the stored stop applies as normal.
+SL_GRACE_DAYS = 10
+SL_GRACE_MULT = 2.0
+
 
 def _now_iso() -> str:
     return datetime.now().isoformat()
@@ -253,8 +260,17 @@ def check_and_update_target_hits(force: bool = False) -> dict:
     """Resolve each pick into hit / miss / still-pending.
 
     A pick counts as a MISS when either:
-      * the stock CLOSED below the stop before the long target was reached, or
+      * the stock CLOSED below the stop in force before the long target was
+        reached, or
       * 45 days passed with neither level resolved.
+
+    The stop in force widens for the first SL_GRACE_DAYS calendar days after the
+    call: a new pick often dips before it works, and stopping it out on that dip
+    scores the entry timing rather than the thesis. Inside the grace window only
+    a close below entry - SL_GRACE_MULT × R (twice the stop distance) is a miss;
+    from the day after the window the stored stop applies unchanged. A pick that
+    is already through the wide stop at day 10 is not retroactively spared — the
+    scan walks bars in order, so whichever level was live on that bar decides.
 
     The short target (T1, 1R) is tracked alongside but never resolves a pick — it
     is an early read that the move is underway while T2 is still in play.
@@ -284,7 +300,7 @@ def check_and_update_target_hits(force: bool = False) -> dict:
         cur = _cur(conn)
         pending_only = "" if force else "target_hit IS NULL AND "
         cur.execute(
-            "SELECT id, ticker, date, target, target_short, stop_loss, "
+            "SELECT id, ticker, date, target, target_short, stop_loss, price_at_pick, "
             "target_hit, sl_hit, target_short_hit FROM picks "
             f"WHERE {pending_only}target IS NOT NULL AND date <= %s",
             (today.isoformat(),),
@@ -307,8 +323,14 @@ def check_and_update_target_hits(force: bool = False) -> dict:
         target     = row["target"]
         target_s   = row["target_short"]
         stop_loss  = row["stop_loss"]
+        entry      = row["price_at_pick"]
         picked_on  = date_type.fromisoformat(pick_date)
         days_since = (today - picked_on).days
+
+        # Wide stop for the grace window. Without a recorded entry there is no R
+        # to double, so those rows keep the stored stop from day one.
+        grace_stop = (entry - SL_GRACE_MULT * (entry - stop_loss)
+                      if entry is not None and stop_loss is not None else stop_loss)
 
         try:
             fetch_end = (today + timedelta(days=1)).isoformat()
@@ -344,16 +366,22 @@ def check_and_update_target_hits(force: bool = False) -> dict:
             # confirmation the move is underway, not an exit.
             target_event = None
             sl_event     = None
+            sl_in_grace  = False
             t1_event     = None
             for i in range(start_i, len(dates)):
                 if t1_event is None and target_s is not None and highs[i] >= target_s:
                     t1_event = dates[i]
+                # Inside the grace window only the doubled stop counts; after it the
+                # stored stop takes over.
+                in_grace = (dates[i] - picked_on).days <= SL_GRACE_DAYS
+                stop_now = grace_stop if in_grace else stop_loss
                 # SL is judged on the CLOSE, not the intraday low: a wick through the
                 # stop that recovers by the bell is noise, not a broken thesis. SL is
                 # checked first so a bar that both closes below stop and tags the
                 # target counts as a miss.
-                if stop_loss is not None and closes[i] <= stop_loss:
-                    sl_event = dates[i]
+                if stop_now is not None and closes[i] <= stop_now:
+                    sl_event    = dates[i]
+                    sl_in_grace = in_grace
                     break
                 if highs[i] >= target:
                     target_event = dates[i]
@@ -365,7 +393,9 @@ def check_and_update_target_hits(force: bool = False) -> dict:
                 hits    += 1
             elif sl_event:
                 outcome  = (0, None, None, 1, sl_event.isoformat(), (sl_event - picked_on).days)
-                verdict  = f"SL hit before target: {ticker} pick={pick_date} sl={sl_event} days={outcome[5]}"
+                which    = f"2R stop {grace_stop:.2f} (grace)" if sl_in_grace else f"stop {stop_loss:.2f}"
+                verdict  = (f"SL hit before target: {ticker} pick={pick_date} sl={sl_event} "
+                            f"days={outcome[5]} via {which}")
                 misses  += 1
             elif days_since > 45:
                 outcome  = (0, None, None, 0, None, None)
