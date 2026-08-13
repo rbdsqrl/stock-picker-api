@@ -212,29 +212,17 @@ def screen_stop():
     return {"status": "stopping"}
 
 @app.get("/api/prices")
-def current_prices(tickers: str):
-    """Return latest close price for a comma-separated list of NSE tickers (no .NS suffix)."""
-    import yfinance as yf
-    from datetime import date as _date, timedelta
-    import pandas as pd
+async def current_prices(tickers: str):
+    """Latest price for a comma-separated list of NSE tickers (no .NS suffix).
 
-    start = (_date.today() - timedelta(days=7)).isoformat()
-    end   = (_date.today() + timedelta(days=1)).isoformat()
-
-    result = {}
-    for sym in [t.strip() for t in tickers.split(",") if t.strip()]:
-        try:
-            df = yf.Ticker(sym + ".NS").history(start=start, end=end, actions=False)
-            if df.empty:
-                continue
-            # Strip TZ-aware index before any pandas ops to avoid SystemError/SIGBUS
-            df = df.reset_index(drop=True)
-            price = pd.to_numeric(df["Close"], errors="coerce").dropna()
-            if not price.empty:
-                result[sym] = round(float(price.iloc[-1]), 2)
-        except (Exception, SystemError) as e:
-            log.warning(f"current_prices: {sym} failed — {e}")
-    return result
+    The fetch is batched and cached in fetch_current_prices(); this used to loop one
+    chart request per ticker, which Yahoo throttled after the first symbol or two and
+    left the History "Now" column nearly empty. Run off-thread so a slow Yahoo does
+    not block the event loop.
+    """
+    from signals import fetch_current_prices
+    syms = [t.strip() for t in tickers.split(",") if t.strip()]
+    return await asyncio.to_thread(fetch_current_prices, syms)
 
 @app.get("/api/analyse")
 def analyse(ticker: str):

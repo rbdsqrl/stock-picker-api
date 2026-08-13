@@ -763,6 +763,79 @@ def fetch_quote_batch(symbols: list[str]) -> dict[str, dict]:
     return out
 
 
+_PRICE_CACHE: dict[str, tuple[float, float]] = {}   # symbol -> (fetched_at, price)
+_PRICE_TTL_SEC       = 90
+PRICE_FALLBACK_MAX   = 10    # per-ticker chart calls allowed after the batch
+
+
+def fetch_current_prices(tickers: list[str]) -> dict[str, float]:
+    """Latest price for many NSE tickers (no .NS suffix), in as few requests as possible.
+
+    The History page asks for every ticker it is showing — 30 days of picks is easily
+    a hundred symbols. Fetching those one chart call at a time is exactly the pattern
+    that gets the IP blocked (see CLAUDE.md rule 1): Yahoo answered the first symbol
+    or two and threw the rest away, so the "Now" column came back with a single price.
+
+    So the batched quote endpoint does the work — one request per QUOTE_BATCH_SIZE
+    symbols, with backoff — and only the handful it misses fall back to a chart call,
+    capped at PRICE_FALLBACK_MAX. Results are cached briefly because the page refetches
+    them on every load, and a symbol that fails is served from a stale cache entry
+    rather than dropped, since a slightly old price beats a blank cell.
+    """
+    # Keyed by the symbol exactly as asked for — the UI looks prices up by the ticker
+    # string it sent, so normalising the case here would orphan every row.
+    syms = [t.strip() for t in tickers if t.strip()]
+    if not syms:
+        return {}
+
+    now = time.time()
+    out: dict[str, float] = {}
+    wanted: list[str] = []
+    for sym in dict.fromkeys(syms):          # de-duped, order preserved
+        hit = _PRICE_CACHE.get(sym)
+        if hit and now - hit[0] < _PRICE_TTL_SEC:
+            out[sym] = hit[1]
+        else:
+            wanted.append(sym)
+
+    if wanted:
+        quotes = fetch_quote_batch([s + ".NS" for s in wanted])
+        for sym in list(wanted):
+            q = quotes.get(sym + ".NS") or {}
+            # regularMarketPrice is absent before the open on some rows; the previous
+            # close is the honest stand-in and is what the chart call would return too.
+            px = q.get("regularMarketPrice") or q.get("regularMarketPreviousClose")
+            if px:
+                out[sym] = round(float(px), 2)
+                _PRICE_CACHE[sym] = (now, out[sym])
+                wanted.remove(sym)
+
+    # Stragglers: one chart call each, no retry sleep — this is serving a page request.
+    for sym in wanted[:PRICE_FALLBACK_MAX]:
+        try:
+            df, _ = _fetch_history(yf.Ticker(sym + ".NS"), f"price {sym}",
+                                   period="5d", attempts=1)
+            if df is None or df.empty:
+                continue
+            px = pd.to_numeric(df["Close"], errors="coerce").dropna()
+            if not px.empty:
+                out[sym] = round(float(px.iloc[-1]), 2)
+                _PRICE_CACHE[sym] = (now, out[sym])
+        except (Exception, SystemError) as e:
+            log.warning(f"fetch_current_prices: {sym} failed — {e}")
+
+    missing = [s for s in dict.fromkeys(syms) if s not in out]
+    for sym in missing:                       # stale beats blank
+        stale = _PRICE_CACHE.get(sym)
+        if stale:
+            out[sym] = stale[1]
+
+    still = [s for s in dict.fromkeys(syms) if s not in out]
+    log.info(f"fetch_current_prices: {len(out)}/{len(set(syms))} resolved"
+             + (f" — no price for {', '.join(still[:10])}" if still else ""))
+    return out
+
+
 def enrich_quotes(candidates: list[dict], emit=None) -> int:
     """Fill company name and valuation basics for every survivor, cheaply.
 
