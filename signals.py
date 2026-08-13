@@ -764,74 +764,68 @@ def fetch_quote_batch(symbols: list[str]) -> dict[str, dict]:
 
 
 _PRICE_CACHE: dict[str, tuple[float, float]] = {}   # symbol -> (fetched_at, price)
-_PRICE_TTL_SEC       = 90
-PRICE_FALLBACK_MAX   = 10    # per-ticker chart calls allowed after the batch
+_PRICE_TTL_SEC     = 120
+PRICE_MAX_FETCH    = 25     # chart calls one request may spend; the UI asks in 5s
+PRICE_REQUEST_GAP  = 0.25   # seconds between chart calls inside one request
 
 
 def fetch_current_prices(tickers: list[str]) -> dict[str, float]:
-    """Latest price for many NSE tickers (no .NS suffix), in as few requests as possible.
+    """Latest price for a small batch of NSE tickers (no .NS suffix).
 
-    The History page asks for every ticker it is showing — 30 days of picks is easily
-    a hundred symbols. Fetching those one chart call at a time is exactly the pattern
-    that gets the IP blocked (see CLAUDE.md rule 1): Yahoo answered the first symbol
-    or two and threw the rest away, so the "Now" column came back with a single price.
+    The chart endpoint does the work here, one call per symbol. That is deliberate
+    even though the batched quote endpoint covers 50 symbols per request: quote is
+    crumb-authenticated and Yahoo blocks it from Render's shared IP, so routing this
+    through fetch_quote_batch cost the full _yf_retry backoff — a single ticker took
+    61s to answer, all of it waiting on a batch that was never going to succeed —
+    before falling through to a chart call that worked first time. Chart is the cheap
+    unauthenticated endpoint the screener already leans on, so it is the primary path.
 
-    So the batched quote endpoint does the work — one request per QUOTE_BATCH_SIZE
-    symbols, with backoff — and only the handful it misses fall back to a chart call,
-    capped at PRICE_FALLBACK_MAX. Results are cached briefly because the page refetches
-    them on every load, and a symbol that fails is served from a stale cache entry
-    rather than dropped, since a slightly old price beats a blank cell.
+    That trades requests for reliability, so the caller must keep batches small: the
+    History page asks in groups of 5 and only for the page it is showing. Anything
+    past PRICE_MAX_FETCH in one request is served from cache or not at all, which
+    keeps a stray large query from spending the whole rate-limit budget.
+
+    Results are cached for _PRICE_TTL_SEC because the page refetches on every load,
+    and a symbol that fails now is served from a stale entry rather than dropped — a
+    slightly old price beats a blank cell.
     """
     # Keyed by the symbol exactly as asked for — the UI looks prices up by the ticker
     # string it sent, so normalising the case here would orphan every row.
-    syms = [t.strip() for t in tickers if t.strip()]
+    syms = list(dict.fromkeys(t.strip() for t in tickers if t.strip()))
     if not syms:
         return {}
 
     now = time.time()
     out: dict[str, float] = {}
     wanted: list[str] = []
-    for sym in dict.fromkeys(syms):          # de-duped, order preserved
+    for sym in syms:
         hit = _PRICE_CACHE.get(sym)
         if hit and now - hit[0] < _PRICE_TTL_SEC:
             out[sym] = hit[1]
         else:
             wanted.append(sym)
 
-    if wanted:
-        quotes = fetch_quote_batch([s + ".NS" for s in wanted])
-        for sym in list(wanted):
-            q = quotes.get(sym + ".NS") or {}
-            # regularMarketPrice is absent before the open on some rows; the previous
-            # close is the honest stand-in and is what the chart call would return too.
-            px = q.get("regularMarketPrice") or q.get("regularMarketPreviousClose")
-            if px:
-                out[sym] = round(float(px), 2)
-                _PRICE_CACHE[sym] = (now, out[sym])
-                wanted.remove(sym)
-
-    # Stragglers: one chart call each, no retry sleep — this is serving a page request.
-    for sym in wanted[:PRICE_FALLBACK_MAX]:
+    for i, sym in enumerate(wanted[:PRICE_MAX_FETCH]):
         try:
+            # attempts=1: no retry sleep, because this is serving a page request.
             df, _ = _fetch_history(yf.Ticker(sym + ".NS"), f"price {sym}",
                                    period="5d", attempts=1)
-            if df is None or df.empty:
-                continue
-            px = pd.to_numeric(df["Close"], errors="coerce").dropna()
-            if not px.empty:
-                out[sym] = round(float(px.iloc[-1]), 2)
-                _PRICE_CACHE[sym] = (now, out[sym])
+            if df is not None and not df.empty:
+                px = pd.to_numeric(df["Close"], errors="coerce").dropna()
+                if not px.empty:
+                    out[sym] = round(float(px.iloc[-1]), 2)
+                    _PRICE_CACHE[sym] = (now, out[sym])
         except (Exception, SystemError) as e:
             log.warning(f"fetch_current_prices: {sym} failed — {e}")
+        if i + 1 < min(len(wanted), PRICE_MAX_FETCH):
+            time.sleep(PRICE_REQUEST_GAP)
 
-    missing = [s for s in dict.fromkeys(syms) if s not in out]
-    for sym in missing:                       # stale beats blank
-        stale = _PRICE_CACHE.get(sym)
-        if stale:
-            out[sym] = stale[1]
+    for sym in syms:                          # stale beats blank
+        if sym not in out and sym in _PRICE_CACHE:
+            out[sym] = _PRICE_CACHE[sym][1]
 
-    still = [s for s in dict.fromkeys(syms) if s not in out]
-    log.info(f"fetch_current_prices: {len(out)}/{len(set(syms))} resolved"
+    still = [s for s in syms if s not in out]
+    log.info(f"fetch_current_prices: {len(out)}/{len(syms)} resolved"
              + (f" — no price for {', '.join(still[:10])}" if still else ""))
     return out
 
