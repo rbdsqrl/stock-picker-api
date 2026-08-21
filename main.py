@@ -6,9 +6,9 @@ import threading
 import asyncio
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from signals import run_screening, run_screening_combined
-from database import init_db, get_today_picks, get_history, save_pick, update_outcome, check_and_update_target_hits, recalculate_all_levels
+from database import init_db, get_today_picks, get_history, save_pick, update_outcome, check_and_update_target_hits, recalculate_all_levels, get_pick_events
 
 log = logging.getLogger(__name__)
 
@@ -111,6 +111,16 @@ def history():
     rows = get_history(limit=30)
     return {"picks": rows}
 
+@app.get("/api/pick/events")
+def pick_events(since: str | None = None, pick_id: int | None = None, limit: int = 200):
+    """Outcome transitions — what turned, when, and which bar decided it.
+
+    `since` is an ISO timestamp the client holds as its seen-marker; without one
+    the caller gets the most recent `limit` events. `pick_id` returns a single
+    call's trail in chronological order instead.
+    """
+    return {"events": get_pick_events(since=since, pick_id=pick_id, limit=limit)}
+
 @app.post("/api/pick/refresh-outcomes")
 async def refresh_outcomes():
     """Re-score past picks against the levels they were published with.
@@ -124,7 +134,12 @@ async def refresh_outcomes():
     try:
         # force=True re-resolves picks that already have an outcome, so the
         # SL-before-target rule is applied to rows scored under the old logic.
-        result = await asyncio.to_thread(check_and_update_target_hits, True)
+        # Aware and in UTC on purpose: this is compared against a TIMESTAMPTZ column.
+        # A naive datetime.now() carries IST wall time with no offset, which Postgres
+        # reads as UTC — five and a half hours in the future, so the window matched
+        # nothing and the banner listed no calls at all.
+        started = datetime.now(timezone.utc).isoformat()
+        result  = await asyncio.to_thread(check_and_update_target_hits, True, "manual_refresh")
         log.info(
             f"refresh_outcomes: done — changed={result['updated']} hits={result['hits']} "
             f"t1={result['t1_hits']} misses={result['misses']} pending={result['pending']} "
@@ -137,6 +152,9 @@ async def refresh_outcomes():
             "misses":       result["misses"],
             "pending":      result["pending"],
             "failed":       result["failed"],
+            # What this run changed, so the banner can name the calls instead of
+            # leaving a count for the user to go hunting through the table for.
+            "events":       await asyncio.to_thread(get_pick_events, started),
         }
     except Exception as e:
         log.exception(f"refresh_outcomes: failed — {e}")
@@ -155,7 +173,7 @@ async def recalculate_levels():
     try:
         recalculated = await asyncio.to_thread(recalculate_all_levels)
         # Levels just moved, so every stored outcome is stale — re-resolve them all.
-        result = await asyncio.to_thread(check_and_update_target_hits, True)
+        result = await asyncio.to_thread(check_and_update_target_hits, True, "recalc_levels")
         log.info(
             f"recalculate_levels: done — levels={recalculated} changed={result['updated']} "
             f"hits={result['hits']} t1={result['t1_hits']} misses={result['misses']} "

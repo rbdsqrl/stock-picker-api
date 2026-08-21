@@ -141,9 +141,141 @@ def init_db():
             END $$;
         """)
 
+        # ── Change trail ─────────────────────────────────────────────────────
+        # Every outcome transition a scan records, kept as its own row. The picks
+        # table only ever holds the CURRENT verdict — it overwrites — so without
+        # this there is no way to say which calls turned, when, or which bar
+        # decided it. Reversals (a force re-score clearing a pick back to open)
+        # are recorded the same way rather than erasing what was there before.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS pick_events (
+                id          SERIAL PRIMARY KEY,
+                pick_id     INTEGER REFERENCES picks(id) ON DELETE CASCADE,
+                noticed_at  TIMESTAMPTZ DEFAULT NOW(),
+                event_date  TEXT,
+                days        INTEGER,
+                kind        TEXT NOT NULL,
+                from_state  TEXT,
+                to_state    TEXT,
+                price       REAL,
+                source      TEXT
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_pick_events_noticed "
+                    "ON pick_events (noticed_at DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_pick_events_pick "
+                    "ON pick_events (pick_id)")
+
         conn.commit()
+
+        # Seed the trail from outcomes that were resolved before it existed. Runs
+        # once — the guard is the table being empty, not a migration flag — and
+        # stamps noticed_at in the past so a first load doesn't report the whole
+        # back catalogue as fresh news.
+        _backfill_pick_events(conn)
     finally:
         conn.close()
+
+
+def _backfill_pick_events(conn):
+    """One-time seed of pick_events from the hit dates already on picks.
+
+    Only the milestones the picks table can prove are reconstructed: T1, T2 and
+    SL each carry their own date and day count. A 45-day expiry has no date
+    column, so it is dated from the pick date + 45 days. The deciding price is
+    not recoverable — those columns were never stored — and stays NULL rather
+    than being invented from the entry.
+    """
+    cur = _cur(conn)
+    cur.execute("SELECT COUNT(*) AS n FROM pick_events")
+    if cur.fetchone()["n"] > 0:
+        return
+
+    cur.execute(
+        "SELECT id, date, target_hit, target_hit_date, target_hit_days, "
+        "sl_hit, sl_hit_date, sl_hit_days, "
+        "target_short_hit, target_short_hit_date, target_short_hit_days "
+        "FROM picks WHERE target_hit IS NOT NULL OR target_short_hit = 1"
+    )
+    rows = cur.fetchall()
+
+    seeded = 0
+    for row in rows:
+        events = []
+        if row["target_short_hit"] == 1 and row["target_short_hit_date"]:
+            events.append(("t1_hit", row["target_short_hit_date"], row["target_short_hit_days"]))
+        if row["target_hit"] == 1 and row["target_hit_date"]:
+            events.append(("t2_hit", row["target_hit_date"], row["target_hit_days"]))
+        elif row["sl_hit"] == 1 and row["sl_hit_date"]:
+            events.append(("sl_hit", row["sl_hit_date"], row["sl_hit_days"]))
+        elif row["target_hit"] == 0:
+            try:
+                expiry = (date_type.fromisoformat(row["date"]) + timedelta(days=45)).isoformat()
+            except Exception:
+                expiry = None
+            events.append(("expired", expiry, 45))
+
+        # Chronological, so walking the trail replays the call in order. Undated
+        # rows sort last — they are the ones with nothing better to go on.
+        events.sort(key=lambda e: e[1] or "9999-99-99")
+
+        state = (None, None, None)  # (t2, sl, t1)
+        for kind, ev_date, days in events:
+            frm   = _outcome_state(*state)
+            state = _apply_milestone(state, kind)
+            to    = _outcome_state(*state)
+            cur.execute(
+                "INSERT INTO pick_events "
+                "(pick_id, noticed_at, event_date, days, kind, from_state, to_state, price, source) "
+                "VALUES (%s, COALESCE(%s::timestamptz, NOW()), %s, %s, %s, %s, %s, NULL, 'backfill')",
+                (row["id"], f"{ev_date} 18:00" if ev_date else None,
+                 ev_date, days, kind, frm, to),
+            )
+            seeded += 1
+
+    conn.commit()
+    if seeded:
+        log.info(f"pick_events: backfilled {seeded} event(s) from stored hit dates")
+
+
+# ── Outcome state helpers ─────────────────────────────────────────────────────
+# One vocabulary for "where does this call stand", shared by the event writer and
+# the backfill so a transition recorded today and one reconstructed from history
+# describe themselves identically. The names match what the History table renders.
+
+def _outcome_state(t2, sl, t1) -> str:
+    """Collapse the three stored flags into the single state the UI shows."""
+    if t2 == 1:
+        return "t2"
+    # A high touch (T1) necessarily precedes a close below the stop on the same
+    # bar, so a pick that reached T1 banked that gain before it was stopped.
+    if sl == 1 and t1 == 1:
+        return "t1_sl"
+    if sl == 1:
+        return "sl"
+    if t2 == 0 and t1 == 1:
+        return "t1_exp"
+    if t2 == 0:
+        return "expired"
+    if t1 == 1:
+        return "t1"
+    return "waiting"
+
+
+def _apply_milestone(state, kind):
+    """The (t2, sl, t1) triple after one milestone lands."""
+    t2, sl, t1 = state
+    if kind == "t1_hit":
+        return (t2, sl, 1)
+    if kind == "t2_hit":
+        return (1, 0, t1)
+    if kind == "sl_hit":
+        return (0, 1, t1)
+    if kind == "expired":
+        return (0, 0, t1)
+    if kind == "cleared":
+        return (None, None, t1)
+    return state
 
 
 def save_pick(pick: dict, rank: int = 1):
@@ -256,7 +388,63 @@ def get_history(limit=30) -> list[dict]:
         conn.close()
 
 
-def check_and_update_target_hits(force: bool = False) -> dict:
+def get_pick_events(since: str | None = None, pick_id: int | None = None,
+                    limit: int = 200) -> list[dict]:
+    """Outcome transitions, newest first, joined to the call they belong to.
+
+    `since` filters on when the scan NOTICED the change, not on the bar that
+    caused it: the History strip answers "what turned while I was away", and a
+    pick that resolved on Wednesday's bar but was only scored on Friday is news
+    on Friday. `pick_id` narrows to one call's trail, where chronological order
+    by bar date is what reads correctly, so those come back oldest first.
+    """
+    conn = get_conn()
+    try:
+        cur = _cur(conn)
+        where, params = [], []
+        if since:
+            where.append("e.noticed_at > %s::timestamptz")
+            params.append(since)
+        if pick_id is not None:
+            where.append("e.pick_id = %s")
+            params.append(pick_id)
+        clause = ("WHERE " + " AND ".join(where)) if where else ""
+        # A trail reads by the bar that caused each step, not by when it was
+        # scored — a hit found forty days late still belongs at its own date.
+        # Steps with no bar behind them (a re-score clearing an outcome) fall
+        # back to the day they were noticed, which puts them in the right place
+        # instead of parking every one of them at the end.
+        order  = ("COALESCE(e.event_date, e.noticed_at::date::text) ASC, e.id ASC"
+                  if pick_id is not None else "e.noticed_at DESC, e.id DESC")
+        params.append(limit)
+
+        cur.execute(f"""
+            SELECT e.id, e.pick_id, e.noticed_at, e.event_date, e.days, e.kind,
+                   e.from_state, e.to_state, e.price, e.source,
+                   p.ticker, p.company, p.date AS pick_date, p.rank, p.run_at,
+                   p.price_at_pick, p.target, p.target_short, p.stop_loss
+            FROM pick_events e
+            JOIN picks p ON p.id = e.pick_id
+            {clause}
+            ORDER BY {order}
+            LIMIT %s
+        """, tuple(params))
+
+        out = []
+        for r in cur.fetchall():
+            d = dict(r)
+            # ISO strings all the way to the client — the frontend compares these
+            # against a stored seen-marker, and a bare datetime repr would not
+            # round-trip through Date.parse the same way in every browser.
+            if d.get("noticed_at") is not None:
+                d["noticed_at"] = d["noticed_at"].isoformat()
+            out.append(d)
+        return out
+    finally:
+        conn.close()
+
+
+def check_and_update_target_hits(force: bool = False, source: str = "scheduled") -> dict:
     """Resolve each pick into hit / miss / still-pending.
 
     A pick counts as a MISS when either:
@@ -290,6 +478,11 @@ def check_and_update_target_hits(force: bool = False) -> dict:
     back to pending if the data now says so). The manual refresh uses this so
     rows scored under the old target-wins-ties logic get corrected; the daily
     scheduled run stays incremental.
+
+    Every transition is also appended to pick_events, tagged with `source`, so
+    the History tab can say which calls turned and which bar decided each one.
+    The picks table keeps only the current verdict; the event rows are the record
+    of how it got there, reversals included.
     """
     import yfinance as yf
     import pandas as pd
@@ -310,6 +503,7 @@ def check_and_update_target_hits(force: bool = False) -> dict:
         conn.close()
 
     changed = 0
+    events  = 0
     hits    = 0
     t1_hits = 0
     misses  = 0
@@ -365,12 +559,16 @@ def check_and_update_target_hits(force: bool = False) -> dict:
             # T1 is recorded in passing and never breaks the loop — it is early
             # confirmation the move is underway, not an exit.
             target_event = None
+            target_px    = None
             sl_event     = None
+            sl_px        = None
             sl_in_grace  = False
             t1_event     = None
+            t1_px        = None
             for i in range(start_i, len(dates)):
                 if t1_event is None and target_s is not None and highs[i] >= target_s:
                     t1_event = dates[i]
+                    t1_px    = highs[i]
                 # Inside the grace window only the doubled stop counts; after it the
                 # stored stop takes over.
                 in_grace = (dates[i] - picked_on).days <= SL_GRACE_DAYS
@@ -381,10 +579,12 @@ def check_and_update_target_hits(force: bool = False) -> dict:
                 # target counts as a miss.
                 if stop_now is not None and closes[i] <= stop_now:
                     sl_event    = dates[i]
+                    sl_px       = closes[i]
                     sl_in_grace = in_grace
                     break
                 if highs[i] >= target:
                     target_event = dates[i]
+                    target_px    = highs[i]
                     break
 
             if target_event:
@@ -415,6 +615,31 @@ def check_and_update_target_hits(force: bool = False) -> dict:
             if prev == (outcome[0], outcome[3], t1[0]):
                 continue  # already resolved this way — nothing to write
 
+            # What actually turned, in the order the market delivered it. A scan
+            # can catch more than one milestone at once — a pick that ran to T1
+            # and on through T2 between two runs produces both rows, so the trail
+            # reads as the call's life rather than a single jump.
+            milestones = []
+            if t1_event and prev[2] != 1:
+                milestones.append(("t1_hit", t1_event.isoformat(),
+                                   (t1_event - picked_on).days, t1_px))
+            if target_event and prev[0] != 1:
+                milestones.append(("t2_hit", target_event.isoformat(),
+                                   (target_event - picked_on).days, target_px))
+            elif sl_event and prev[1] != 1:
+                milestones.append(("sl_hit", sl_event.isoformat(),
+                                   (sl_event - picked_on).days, sl_px))
+            elif outcome[0] == 0 and not sl_event and prev[0] != 0:
+                # Expired at 45 days. No bar decided it, so no price and no date
+                # beyond the day the window ran out.
+                expiry = (picked_on + timedelta(days=45)).isoformat()
+                milestones.append(("expired", expiry, 45, None))
+            elif outcome[0] is None and prev[0] is not None:
+                # A force re-score can un-resolve a pick — recorded, not erased.
+                milestones.append(("cleared", None, None, None))
+
+            milestones.sort(key=lambda m: m[1] or "9999-99-99")
+
             c = get_conn()
             try:
                 cur2 = _cur(c)
@@ -425,6 +650,20 @@ def check_and_update_target_hits(force: bool = False) -> dict:
                     "WHERE id=%s",
                     (*outcome, *t1, pick_id),
                 )
+                # Same transaction as the UPDATE: an event without the outcome it
+                # describes, or an outcome with no trail, is worse than neither.
+                walk = prev
+                for kind, ev_date, ev_days, ev_px in milestones:
+                    frm  = _outcome_state(*walk)
+                    walk = _apply_milestone(walk, kind)
+                    to   = _outcome_state(*walk)
+                    cur2.execute(
+                        "INSERT INTO pick_events "
+                        "(pick_id, event_date, days, kind, from_state, to_state, price, source) "
+                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                        (pick_id, ev_date, ev_days, kind, frm, to, ev_px, source),
+                    )
+                    events += 1
                 c.commit()
                 changed += 1
             finally:
@@ -438,6 +677,7 @@ def check_and_update_target_hits(force: bool = False) -> dict:
 
     return {
         "updated": changed,
+        "events":  events,
         "hits":    hits,
         "t1_hits": t1_hits,
         "misses":  misses,
