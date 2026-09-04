@@ -8,7 +8,7 @@ import logging
 import os
 from datetime import datetime, timezone
 from signals import run_screening, run_screening_combined
-from database import init_db, get_today_picks, get_history, save_pick, update_outcome, check_and_update_target_hits, recalculate_all_levels, get_pick_events
+from database import init_db, get_today_picks, get_history, save_pick, update_outcome, check_and_update_target_hits, recalculate_all_levels, get_pick_events, recover_flipped_t2_hits
 
 log = logging.getLogger(__name__)
 
@@ -158,6 +158,22 @@ async def refresh_outcomes():
         }
     except Exception as e:
         log.exception(f"refresh_outcomes: failed — {e}")
+        raise
+
+@app.post("/api/pick/recover-t2")
+async def recover_t2():
+    """TEMPORARY — one-off repair endpoint. Remove after running once.
+
+    Restores picks that hit T2 and were later walked back to SL/T1/pending by a
+    force re-score under the pre-fix logic. See recover_flipped_t2_hits().
+    """
+    log.info("recover_t2: started")
+    try:
+        restored = await asyncio.to_thread(recover_flipped_t2_hits)
+        log.info(f"recover_t2: done — restored={len(restored)}")
+        return {"restored_count": len(restored), "restored": restored}
+    except Exception as e:
+        log.exception(f"recover_t2: failed — {e}")
         raise
 
 @app.post("/api/pick/recalculate-levels")

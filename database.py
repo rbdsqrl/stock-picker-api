@@ -474,10 +474,14 @@ def check_and_update_target_hits(force: bool = False, source: str = "scheduled")
     Levels are read as stored — entry, target and stop are anchored to the date
     the call was given and are never recomputed here.
 
-    force=True re-resolves picks that already carry an outcome (and clears it
-    back to pending if the data now says so). The manual refresh uses this so
-    rows scored under the old target-wins-ties logic get corrected; the daily
-    scheduled run stays incremental.
+    force=True re-resolves picks that already carry a SL/expired outcome (and
+    clears one back to pending if the data now says so). The manual refresh
+    uses this so rows scored under the old target-wins-ties logic get
+    corrected; the daily scheduled run stays incremental.
+
+    A pick that has hit T2 is archived, not just resolved: once target_hit=1
+    it is excluded here even under force, so nothing — not a data revision, not
+    a policy change — ever walks it back to SL or T1 after the fact.
 
     Every transition is also appended to pick_events, tagged with `source`, so
     the History tab can say which calls turned and which bar decided each one.
@@ -491,11 +495,13 @@ def check_and_update_target_hits(force: bool = False, source: str = "scheduled")
     conn = get_conn()
     try:
         cur = _cur(conn)
-        pending_only = "" if force else "target_hit IS NULL AND "
+        # T2 is terminal — excluded even under force. Force only reopens SL/expired/
+        # pending rows for re-scoring, never a pick that has already archived as a hit.
+        not_archived = "target_hit IS NULL AND " if not force else "(target_hit IS NULL OR target_hit = 0) AND "
         cur.execute(
             "SELECT id, ticker, date, target, target_short, stop_loss, price_at_pick, "
             "target_hit, sl_hit, target_short_hit FROM picks "
-            f"WHERE {pending_only}target IS NOT NULL AND date <= %s",
+            f"WHERE {not_archived}target IS NOT NULL AND date <= %s",
             (today.isoformat(),),
         )
         rows = cur.fetchall()
@@ -686,6 +692,83 @@ def check_and_update_target_hits(force: bool = False, source: str = "scheduled")
     }
 
 
+def recover_flipped_t2_hits() -> list[dict]:
+    """One-off repair for picks that hit T2, then got walked back to SL/T1/pending
+    by a force re-score under the pre-fix logic (before T2 became terminal here).
+
+    pick_events is append-only and was never touched by the bug, so the original
+    t2_hit (and, if it happened first, t1_hit) milestones are still there. This
+    restores `picks` from the most recent recorded t2_hit event for any pick whose
+    current target_hit no longer says 1, and does the same for target_short_hit
+    from the most recent t1_hit event on that pick. sl_hit is cleared, since T2
+    always outranks SL in _outcome_state. Every restore is logged as a fresh
+    pick_events row (source='recovery') rather than editing history in place.
+
+    Safe to run more than once — a pick already at target_hit=1 is left alone.
+    """
+    conn = get_conn()
+    try:
+        cur = _cur(conn)
+        cur.execute("""
+            SELECT p.id, p.ticker, p.date, p.target_hit AS current_target_hit,
+                   p.sl_hit AS current_sl_hit,
+                   t2.event_date AS t2_date, t2.days AS t2_days, t2.price AS t2_price,
+                   t1.event_date AS t1_date, t1.days AS t1_days, t1.price AS t1_price
+            FROM picks p
+            JOIN LATERAL (
+                SELECT event_date, days, price FROM pick_events
+                WHERE pick_id = p.id AND kind = 't2_hit'
+                ORDER BY noticed_at DESC, id DESC LIMIT 1
+            ) t2 ON true
+            LEFT JOIN LATERAL (
+                SELECT event_date, days, price FROM pick_events
+                WHERE pick_id = p.id AND kind = 't1_hit'
+                ORDER BY noticed_at DESC, id DESC LIMIT 1
+            ) t1 ON true
+            WHERE p.target_hit IS DISTINCT FROM 1
+            ORDER BY p.date, p.id
+        """)
+        rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    restored = []
+    for row in rows:
+        pick_id = row["id"]
+        conn = get_conn()
+        try:
+            cur = _cur(conn)
+            prev = (row["current_target_hit"], row["current_sl_hit"],
+                     1 if row["t1_date"] else None)
+            cur.execute(
+                "UPDATE picks SET target_hit=1, target_hit_date=%s, target_hit_days=%s, "
+                "sl_hit=0, sl_hit_date=NULL, sl_hit_days=NULL"
+                + (", target_short_hit=1, target_short_hit_date=%s, target_short_hit_days=%s"
+                   if row["t1_date"] else "")
+                + " WHERE id=%s",
+                ((row["t2_date"], row["t2_days"])
+                 + ((row["t1_date"], row["t1_days"]) if row["t1_date"] else ())
+                 + (pick_id,)),
+            )
+            frm = _outcome_state(*prev)
+            to  = _outcome_state(1, 0, prev[2])
+            cur.execute(
+                "INSERT INTO pick_events "
+                "(pick_id, event_date, days, kind, from_state, to_state, price, source) "
+                "VALUES (%s,%s,%s,'t2_hit',%s,%s,%s,'recovery')",
+                (pick_id, row["t2_date"], row["t2_days"], frm, to, row["t2_price"]),
+            )
+            conn.commit()
+            restored.append({
+                "pick_id": pick_id, "ticker": row["ticker"], "date": row["date"],
+                "was": frm, "restored_to": to, "t2_date": row["t2_date"],
+            })
+        finally:
+            conn.close()
+
+    return restored
+
+
 def recalculate_all_levels() -> int:
     """Backfill stop / T1 / T2 on historical picks under the current policy.
 
@@ -697,6 +780,10 @@ def recalculate_all_levels() -> int:
 
     Outcomes computed against the old levels are stale afterwards, so callers must
     follow this with check_and_update_target_hits(force=True).
+
+    A pick that has hit T2 is archived: its target and stop are excluded here too,
+    so a policy change can't retroactively move the goalposts on a call that's
+    already banked its win.
     """
     import yfinance as yf
     import pandas as pd
@@ -707,7 +794,7 @@ def recalculate_all_levels() -> int:
         cur = _cur(conn)
         cur.execute(
             "SELECT id, ticker, date, price_at_pick, fundamental_floor_pct "
-            "FROM picks WHERE price_at_pick IS NOT NULL"
+            "FROM picks WHERE price_at_pick IS NOT NULL AND target_hit IS DISTINCT FROM 1"
         )
         rows = cur.fetchall()
     finally:
