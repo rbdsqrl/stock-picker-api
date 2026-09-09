@@ -411,6 +411,56 @@ def get_archive() -> list[dict]:
         conn.close()
 
 
+def backfill_frozen_open_prices() -> dict:
+    """One-off: capture a closing price for every frozen pick that was still open
+    (no target_hit yet) when it was archived, so the Archive tab can show what the
+    call was worth at the moment it was snapshotted instead of leaving it blank.
+
+    Reuses outcome_price/outcome_pct — columns from an earlier, otherwise unused
+    design — rather than adding new ones. Only rows with no outcome_price yet are
+    touched, so this is safe to re-run (e.g. if some tickers failed to fetch).
+    """
+    conn = get_conn()
+    try:
+        cur = _cur(conn)
+        cur.execute("""
+            SELECT id, ticker, price_at_pick FROM picks
+            WHERE frozen_at IS NOT NULL AND target_hit IS NULL AND outcome_price IS NULL
+        """)
+        rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        return {"updated": 0, "failed": []}
+
+    from signals import fetch_current_prices
+    tickers = sorted({r["ticker"] for r in rows})
+    prices: dict[str, float] = {}
+    for i in range(0, len(tickers), 25):
+        prices.update(fetch_current_prices(tickers[i:i + 25]))
+
+    updated, failed = 0, []
+    conn = get_conn()
+    try:
+        cur = _cur(conn)
+        for r in rows:
+            px = prices.get(r["ticker"])
+            if px is None or not r["price_at_pick"]:
+                failed.append(r["ticker"])
+                continue
+            pct = round((px - r["price_at_pick"]) / r["price_at_pick"] * 100, 2)
+            cur.execute(
+                "UPDATE picks SET outcome_price = %s, outcome_pct = %s WHERE id = %s",
+                (px, pct, r["id"]),
+            )
+            updated += 1
+        conn.commit()
+    finally:
+        conn.close()
+    return {"updated": updated, "failed": failed}
+
+
 def get_pick_events(since: str | None = None, pick_id: int | None = None,
                     limit: int = 200) -> list[dict]:
     """Outcome transitions, newest first, joined to the call they belong to.

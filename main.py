@@ -8,7 +8,7 @@ import logging
 import os
 from datetime import datetime, timezone
 from signals import run_screening, run_screening_combined
-from database import init_db, get_today_picks, get_history, save_pick, update_outcome, check_and_update_target_hits, recalculate_all_levels, get_pick_events, get_archive
+from database import init_db, get_today_picks, get_history, save_pick, update_outcome, check_and_update_target_hits, recalculate_all_levels, get_pick_events, get_archive, backfill_frozen_open_prices
 
 log = logging.getLogger(__name__)
 
@@ -116,6 +116,17 @@ def archive():
     """Everything frozen into the one-time Archive snapshot — calls from before the
     snapshot was taken. These never change, so unlike /history there's no limit."""
     return {"picks": get_archive()}
+
+@app.post("/api/pick/backfill-archive-outcomes")
+async def backfill_archive_outcomes():
+    """One-off: fill in a closing price for archived picks that were still open when
+    frozen, so the Archive tab shows what each call was worth at the snapshot moment
+    instead of a blank. Safe to re-run — only rows with no outcome_price yet are
+    touched. Remove this endpoint once it has been run.
+    """
+    result = await asyncio.to_thread(backfill_frozen_open_prices)
+    log.info(f"backfill_archive_outcomes: updated {result['updated']}, failed {result['failed']}")
+    return result
 
 @app.get("/api/pick/events")
 def pick_events(since: str | None = None, pick_id: int | None = None, limit: int = 200):
