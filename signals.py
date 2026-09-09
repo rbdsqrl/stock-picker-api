@@ -138,6 +138,9 @@ SIGNAL_WEIGHTS = {
     "rel_strength": 0.15,
 }
 NEWS_WEIGHT = 0.10           # Applied post-hoc to top 10 ready candidates
+FUNDAMENTAL_WEIGHT = 0.20    # Max swing from the fundamental score, applied post-hoc
+                              # alongside news — same additive-adjustment pattern, just
+                              # a bigger lever since fundamentals carry more evidence.
 
 # ── Upstream request budget ──────────────────────────────────────────────────
 # Yahoo rate-limits by IP, and a hosted runner shares its egress with everyone else
@@ -1234,6 +1237,111 @@ def _join(items: list[str]) -> str:
     return sep.join(items[:-1]) + sep.strip() + " and " + items[-1]
 
 
+# ── Fundamental score ─────────────────────────────────────────────────────────
+# A standalone read of the business, shown next to (not blended away into) the
+# technical score. Only ever computed on stocks that already have `.info` — the
+# wide screen stays price-only per rule 2 in CLAUDE.md; this runs on survivors
+# (post enrich_fundamentals/enrich_valuation in run_screening) and on
+# analyse_stock's single ticker, where the fetch is one-off anyway.
+#
+# Each factor scores only if its input actually resolved, so a throttled fetch
+# degrades to a neutral 50/no adjustment rather than a bad one — same "degrade,
+# don't fail" rule fundamentals enrichment already follows.
+_FUNDAMENTAL_SCORE_RANGE = 13   # max |points| reachable below; scales the 0-100 read
+
+
+def compute_fundamental_score(fundamentals: dict | None, valuation: dict | None,
+                              sector: str) -> dict:
+    """Grade the business on growth, profitability, leverage and valuation.
+
+    Returns `score` (0-100, for display), `adjustment` (a bounded nudge in the
+    technical score's own units, for ranking — mirrors how news sentiment already
+    nudges `score`), and `n_factors` (how many inputs actually resolved, since a
+    score built off 2 of 9 factors deserves less trust than one off 8 of 9).
+    """
+    f = fundamentals or {}
+    v = valuation or {}
+    pts = 0
+    n = 0
+
+    eg = f.get("earnings_growth")
+    if _num(eg):
+        n += 1
+        if eg >= 20:
+            pts += 2
+        elif eg >= 5:
+            pts += 1
+        elif eg < -5:
+            pts -= 2
+
+    rg = f.get("rev_growth")
+    if _num(rg):
+        n += 1
+        if rg >= 15:
+            pts += 1
+        elif rg < 0:
+            pts -= 1
+
+    roe = f.get("roe")
+    if _num(roe):
+        n += 1
+        if roe >= 20:
+            pts += 2
+        elif roe >= 12:
+            pts += 1
+        elif roe < 8:
+            pts -= 1
+
+    dte = f.get("debt_to_equity")
+    if _num(dte) and sector not in _FINANCIAL_SECTORS:
+        n += 1
+        if dte > 150:
+            pts -= 2
+        elif dte < 50:
+            pts += 1
+
+    pe, pe_fwd = f.get("pe"), f.get("pe_fwd")
+    if _num(pe) and _num(pe_fwd):
+        n += 1
+        if pe_fwd < pe:
+            pts += 1
+
+    now, then = v.get("net_margin_now"), v.get("net_margin_then")
+    if _num(now) and _num(then):
+        n += 1
+        if now - then > 0.5:
+            pts += 1
+        elif now - then < -2:
+            pts -= 1
+
+    gap = v.get("pe_vs_peer_pct")
+    if _num(gap) and v.get("peer_n"):
+        n += 1
+        if gap <= -15 and not v.get("parity_caveat"):
+            pts += 2
+        elif gap >= 40:
+            pts -= 1
+
+    pat_cagr = v.get("pat_cagr_pct")
+    if _num(pat_cagr):
+        n += 1
+        if pat_cagr >= 15:
+            pts += 2
+        elif pat_cagr >= 0:
+            pts += 1
+        else:
+            pts -= 2
+
+    net_cash = v.get("net_cash_pct_mcap")
+    if _num(net_cash) and net_cash >= 20:
+        n += 1
+        pts += 1
+
+    score = max(0, min(100, round(50 + pts / _FUNDAMENTAL_SCORE_RANGE * 50)))
+    adjustment = max(-1.0, min(1.0, pts / _FUNDAMENTAL_SCORE_RANGE)) * FUNDAMENTAL_WEIGHT
+    return {"score": score, "adjustment": round(adjustment, 4), "n_factors": n, "pts": pts}
+
+
 def _conviction_evidence(result: dict) -> tuple[int, list[tuple[str, str]], list[str]]:
     """Weigh the evidence for and against the call.
 
@@ -1848,6 +1956,12 @@ def analyse_stock(ticker_sym: str) -> dict:
                 )
         except (Exception, SystemError) as e:
             log.warning(f"analyse_stock valuation: {full_sym} — {e}")
+
+        fs = compute_fundamental_score(result.get("fundamentals"), result.get("valuation"), sector)
+        result["fundamentals"]["fundamental_score"] = fs["score"]
+        result["fundamentals"]["fundamental_score_factors"] = fs["n_factors"]
+        result["score"] = round(result["score"] + fs["adjustment"], 4)
+
         return result
 
     except (Exception, SystemError) as e:
@@ -2024,6 +2138,16 @@ def run_screening_combined(log_cb=None, abort_event=None) -> list[dict]:
     candidates = [r for r in fundamental_set if r.get("target_pct", 0) >= MIN_TARGET_PCT][:15]
 
     enrich_valuation(candidates, fundamental_set, emit)
+
+    for r in candidates:
+        fs = compute_fundamental_score(r.get("fundamentals"), r.get("valuation"), r.get("sector") or "")
+        r["fundamentals"] = dict(r.get("fundamentals") or {})
+        r["fundamentals"]["fundamental_score"] = fs["score"]
+        r["fundamentals"]["fundamental_score_factors"] = fs["n_factors"]
+        r["score"] = round(r["score"] + fs["adjustment"], 4)
+    if candidates:
+        avg_fs = sum(r["fundamentals"]["fundamental_score"] for r in candidates) / len(candidates)
+        emit(f"Fundamental score applied to {len(candidates)} candidates (avg {avg_fs:.0f}/100).")
 
     if candidates:
         emit(f"Fetching news for top {len(candidates)} candidates...")
