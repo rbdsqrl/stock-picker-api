@@ -411,29 +411,6 @@ def get_archive() -> list[dict]:
         conn.close()
 
 
-def freeze_picks_before(cutoff_date: str) -> dict:
-    """One-time snapshot: freeze every pick dated before `cutoff_date` so it moves
-    to the Archive tab and check_and_update_target_hits() never touches it again.
-
-    Idempotent — only rows not already frozen are touched, so calling this twice
-    (or against a cutoff that has already run) is a no-op the second time.
-    """
-    conn = get_conn()
-    try:
-        cur = _cur(conn)
-        cur.execute("""
-            UPDATE picks SET frozen_at = NOW()
-            WHERE date < %s AND frozen_at IS NULL
-            RETURNING id, date, ticker
-        """, (cutoff_date,))
-        rows = cur.fetchall()
-        conn.commit()
-        dates = sorted({r["date"] for r in rows})
-        return {"frozen": len(rows), "dates": dates}
-    finally:
-        conn.close()
-
-
 def get_pick_events(since: str | None = None, pick_id: int | None = None,
                     limit: int = 200) -> list[dict]:
     """Outcome transitions, newest first, joined to the call they belong to.

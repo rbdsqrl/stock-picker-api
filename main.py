@@ -8,7 +8,7 @@ import logging
 import os
 from datetime import datetime, timezone
 from signals import run_screening, run_screening_combined
-from database import init_db, get_today_picks, get_history, save_pick, update_outcome, check_and_update_target_hits, recalculate_all_levels, get_pick_events, get_archive, freeze_picks_before
+from database import init_db, get_today_picks, get_history, save_pick, update_outcome, check_and_update_target_hits, recalculate_all_levels, get_pick_events, get_archive
 
 log = logging.getLogger(__name__)
 
@@ -116,17 +116,6 @@ def archive():
     """Everything frozen into the one-time Archive snapshot — calls from before the
     snapshot was taken. These never change, so unlike /history there's no limit."""
     return {"picks": get_archive()}
-
-@app.post("/api/pick/freeze-before-today")
-def freeze_before_today():
-    """One-off: snapshot every pick dated before today into the Archive tab and stop
-    tracking their outcomes. Idempotent — safe to call more than once, and a no-op on
-    any pick already frozen. Remove this endpoint once it has been run.
-    """
-    cutoff = datetime.now().date().isoformat()
-    result = freeze_picks_before(cutoff)
-    log.info(f"freeze_before_today: froze {result['frozen']} pick(s) across {len(result['dates'])} date(s)")
-    return result
 
 @app.get("/api/pick/events")
 def pick_events(since: str | None = None, pick_id: int | None = None, limit: int = 200):
