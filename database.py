@@ -118,6 +118,7 @@ def init_db():
             ("valuation",             "TEXT"),
             ("run_at",                "TEXT"),
             ("screened_count",        "INTEGER"),
+            ("frozen_at",             "TIMESTAMPTZ"),
         ]:
             cur.execute(f"ALTER TABLE picks ADD COLUMN IF NOT EXISTS {col} {typedef}")
 
@@ -372,18 +373,63 @@ def get_today_picks() -> list[dict]:
 
 
 def get_history(limit=30) -> list[dict]:
-    """Every pick from the last `limit` days, including all runs on the same day."""
+    """Every pick from the last `limit` days, including all runs on the same day.
+
+    Frozen picks (moved to the Archive tab) are excluded — History is the live,
+    still-tracked track record, and a frozen row will never change again anyway.
+    """
     conn = get_conn()
     try:
         cur = _cur(conn)
         cur.execute("""
             SELECT * FROM picks
-            WHERE date IN (
-                SELECT DISTINCT date FROM picks ORDER BY date DESC LIMIT %s
+            WHERE frozen_at IS NULL
+              AND date IN (
+                SELECT DISTINCT date FROM picks WHERE frozen_at IS NULL ORDER BY date DESC LIMIT %s
             )
             ORDER BY date DESC, run_at DESC, rank ASC
         """, (limit,))
         return [_row_to_dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def get_archive() -> list[dict]:
+    """Every frozen pick — the one-time snapshot of everything called before the
+    day the Archive tab was created. Frozen rows never change, so unlike
+    get_history() there is no limit to page against; the frontend pages client-side."""
+    conn = get_conn()
+    try:
+        cur = _cur(conn)
+        cur.execute("""
+            SELECT * FROM picks
+            WHERE frozen_at IS NOT NULL
+            ORDER BY date DESC, run_at DESC, rank ASC
+        """)
+        return [_row_to_dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def freeze_picks_before(cutoff_date: str) -> dict:
+    """One-time snapshot: freeze every pick dated before `cutoff_date` so it moves
+    to the Archive tab and check_and_update_target_hits() never touches it again.
+
+    Idempotent — only rows not already frozen are touched, so calling this twice
+    (or against a cutoff that has already run) is a no-op the second time.
+    """
+    conn = get_conn()
+    try:
+        cur = _cur(conn)
+        cur.execute("""
+            UPDATE picks SET frozen_at = NOW()
+            WHERE date < %s AND frozen_at IS NULL
+            RETURNING id, date, ticker
+        """, (cutoff_date,))
+        rows = cur.fetchall()
+        conn.commit()
+        dates = sorted({r["date"] for r in rows})
+        return {"frozen": len(rows), "dates": dates}
     finally:
         conn.close()
 
@@ -498,10 +544,13 @@ def check_and_update_target_hits(force: bool = False, source: str = "scheduled")
         # T2 is terminal — excluded even under force. Force only reopens SL/expired/
         # pending rows for re-scoring, never a pick that has already archived as a hit.
         not_archived = "target_hit IS NULL AND " if not force else "(target_hit IS NULL OR target_hit = 0) AND "
+        # frozen_at marks a pick moved to the Archive tab as a fixed snapshot — distinct
+        # from the T2 "archived" terminal state above. A frozen pick is excluded here
+        # unconditionally, force included, so nothing ever resumes moving it again.
         cur.execute(
             "SELECT id, ticker, date, target, target_short, stop_loss, price_at_pick, "
             "target_hit, sl_hit, target_short_hit FROM picks "
-            f"WHERE {not_archived}target IS NOT NULL AND date <= %s",
+            f"WHERE {not_archived}frozen_at IS NULL AND target IS NOT NULL AND date <= %s",
             (today.isoformat(),),
         )
         rows = cur.fetchall()
